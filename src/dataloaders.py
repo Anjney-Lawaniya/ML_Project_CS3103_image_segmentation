@@ -112,8 +112,8 @@ def get_dataloaders(
     """
     if batch_size <= 0:
         raise ValueError("batch_size must be a positive integer")
-    if num_workers < 0:
-        raise ValueError("num_workers must be nonnegative")
+    if num_workers <= 0:
+        raise ValueError("num_workers must be positive when persistent workers are enabled")
 
     split_dir = Path("data") / "splits"
     raw_data_root = Path("data") / "raw"
@@ -133,6 +133,7 @@ def get_dataloaders(
         "batch_size": batch_size,
         "num_workers": num_workers,
         "pin_memory": torch.cuda.is_available(),
+        "persistent_workers": True,
     }
     train_loader = DataLoader(
         train_dataset, shuffle=True, generator=generator, **common_loader_options

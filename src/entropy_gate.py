@@ -1,19 +1,17 @@
-"""Differentiable Shannon entropy gates for spatial feature routing."""
+"""Parameter-free Shannon entropy routing with a straight-through estimator."""
 
 from __future__ import annotations
-
-import math
 
 import torch
 from torch import Tensor, nn
 
 
 class StraightThroughEstimator(torch.autograd.Function):
-    """Binarize a routing signal while passing gradients through unchanged."""
+    """Binarize continuous entropy while passing upstream gradients unchanged."""
 
     @staticmethod
-    def forward(ctx: object, continuous_mask: Tensor, threshold: float) -> Tensor:
-        return (continuous_mask > threshold).to(dtype=continuous_mask.dtype)
+    def forward(ctx: object, entropy: Tensor, threshold: float) -> Tensor:
+        return (entropy > threshold).to(dtype=entropy.dtype)
 
     @staticmethod
     def backward(ctx: object, output_gradient: Tensor) -> tuple[Tensor, None]:
@@ -21,19 +19,21 @@ class StraightThroughEstimator(torch.autograd.Function):
 
 
 class ShannonEntropyGate(nn.Module):
-    """Produce a binary spatial route from feature-wise pseudo-probabilities."""
+    """Threshold normalized binary entropy from one-channel auxiliary logits."""
 
-    def __init__(self, input_channels: int, threshold: float = 0.5) -> None:
+    def __init__(self, threshold: float = 0.5, eps: float = 1e-7) -> None:
         super().__init__()
-        self.threshold = threshold
-        self.probability_projection = nn.Conv2d(input_channels, 2, kernel_size=1)
+        self.threshold = float(threshold)
+        self.eps = float(eps)
 
-    def forward(self, feature_map: Tensor) -> Tensor:
-        pseudo_probabilities = torch.softmax(self.probability_projection(feature_map), dim=1)
-        pixel_entropy = -torch.sum(
-            pseudo_probabilities * torch.log(pseudo_probabilities.clamp_min(torch.finfo(feature_map.dtype).eps)),
-            dim=1,
-            keepdim=True,
+    def forward(self, auxiliary_logits: Tensor) -> tuple[Tensor, Tensor]:
+        probabilities = torch.sigmoid(auxiliary_logits.float()).clamp(
+            min=self.eps,
+            max=1.0 - self.eps,
         )
-        normalized_entropy = pixel_entropy / math.log(2.0)
-        return StraightThroughEstimator.apply(normalized_entropy, self.threshold)
+        entropy = -(
+            probabilities * torch.log2(probabilities)
+            + (1.0 - probabilities) * torch.log2(1.0 - probabilities)
+        )
+        routing_mask = StraightThroughEstimator.apply(entropy, self.threshold)
+        return routing_mask, entropy
