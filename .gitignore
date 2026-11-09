@@ -1,0 +1,11 @@
+﻿data/raw/*
+!data/README.md
+!data/splits/
+models/*.pt
+models/*.pth
+!models/.gitkeep
+__pycache__/
+.ipynb_checkpoints/
+.venv/
+venv/
+.env

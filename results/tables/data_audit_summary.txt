@@ -1,0 +1,11 @@
+Training Data Audit Summary
+============================
+Total training images: 775
+Total unreadable/corrupted files: 0
+Pixel totals include only pairs with a readable image and mask.
+Masks with non-binary values: 0
+Background pixels (value 0): 1659807135
+Foreground pixels (value 1 or 255): 83942865
+Intermediate mask pixels (excluded): 0
+Background: 95.186072258065% of binary pixels
+Foreground: 4.813927741935% of binary pixels
