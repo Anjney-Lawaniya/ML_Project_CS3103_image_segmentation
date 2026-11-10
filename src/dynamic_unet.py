@@ -78,7 +78,7 @@ class DualPathDecoderBlock(nn.Module):
                 ).transpose(0, 1)
                 flattened_output = feature_map.new_zeros(
                     (convolution.out_channels, height * width)
-                ).index_copy(1, active_indices, active_values)
+                ).index_copy(1, active_indices, active_values.to(feature_map.dtype))
             flattened_outputs.append(
                 flattened_output.reshape(convolution.out_channels, height, width)
             )

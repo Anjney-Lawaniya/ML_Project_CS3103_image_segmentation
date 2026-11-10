@@ -32,6 +32,16 @@ class SegmentationTransform:
         mask_array = np.asarray(mask.convert("L"), dtype=np.uint8).copy()
         image_tensor = torch.from_numpy(image_array).permute(2, 0, 1).to(torch.float32).div_(255.0)
         mask_tensor = torch.from_numpy(mask_array).unsqueeze(0).to(torch.float32)
+        image_tensor = v2_functional.resize(
+            image_tensor,
+            size=[512, 512],
+            interpolation=InterpolationMode.BILINEAR,
+        )
+        mask_tensor = v2_functional.resize(
+            mask_tensor,
+            size=[512, 512],
+            interpolation=InterpolationMode.NEAREST,
+        )
         mask_tensor = (mask_tensor > 0).to(torch.float32)
 
         if image_tensor.shape[-2:] != mask_tensor.shape[-2:]:
