@@ -246,7 +246,8 @@ class DynamicUNet(nn.Module):
 
 
 if __name__ == "__main__":
-    model = DynamicUNet().to("cuda")
-    dummy_input = torch.randn(1, 3, 512, 512, device="cuda")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = DynamicUNet().to(device)
+    dummy_input = torch.randn(1, 3, 512, 512, device=device)
     output = model(dummy_input)
     print(tuple(output.shape))

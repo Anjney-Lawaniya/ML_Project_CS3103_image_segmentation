@@ -11,6 +11,7 @@ from PIL import Image
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms.v2 import functional as v2_functional
 
+# Found through eda loop ran before writing this file
 TRAIN_MEAN = (0.43380652, 0.43693942, 0.40113835)
 TRAIN_STD = (0.29580833, 0.28946298, 0.30155425)
 
@@ -20,8 +21,8 @@ class SegmentationTransform:
     """Convert and normalize paired PIL data, optionally augmenting it jointly.
 
     Spatial operations use torchvision.transforms.v2 functional transforms
-    with shared random decisions. Masks use nearest-neighbor interpolation and
-    are thresholded after geometry, so their output remains strictly binary.
+    with shared random decisions. Quarter-turn rotations use exact tensor
+    permutations so neither image nor binary mask receives interpolation.
     """
 
     training: bool
@@ -59,17 +60,8 @@ class SegmentationTransform:
                 mask_tensor = v2_functional.vertical_flip(mask_tensor)
             if random.random() < 0.5:
                 quarter_turns = random.choice((1, 2, 3))
-                angle = quarter_turns * 90
-                image_tensor = v2_functional.rotate(
-                    image_tensor,
-                    angle=angle,
-                    interpolation=InterpolationMode.BILINEAR,
-                )
-                mask_tensor = v2_functional.rotate(
-                    mask_tensor,
-                    angle=angle,
-                    interpolation=InterpolationMode.NEAREST,
-                )
+                image_tensor = torch.rot90(image_tensor, k=quarter_turns, dims=(-2, -1))
+                mask_tensor = torch.rot90(mask_tensor, k=quarter_turns, dims=(-2, -1))
 
         mean = torch.tensor(TRAIN_MEAN, dtype=image_tensor.dtype).view(3, 1, 1)
         std = torch.tensor(TRAIN_STD, dtype=image_tensor.dtype).view(3, 1, 1)

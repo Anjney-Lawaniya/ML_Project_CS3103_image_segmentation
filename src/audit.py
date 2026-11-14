@@ -74,6 +74,8 @@ def audit_training_data(
     nonbinary_masks: set[str] = set()
     background_pixels = 0
     foreground_pixels = 0
+    effective_background_pixels = 0
+    effective_foreground_pixels = 0
     intermediate_mask_pixels = 0
 
     for filename in tqdm(filenames, desc="Auditing training data", unit="pair"):
@@ -107,7 +109,9 @@ def audit_training_data(
         if not image_ok:
             continue
         background_pixels += int(np.count_nonzero(mask_array == 0))
-        foreground_pixels += int(np.count_nonzero((mask_array == 1) | (mask_array == 255)))
+        foreground_pixels += int(np.count_nonzero(np.isin(mask_array, (1, 255))))
+        effective_background_pixels += int(np.count_nonzero(mask_array == 0))
+        effective_foreground_pixels += int(np.count_nonzero(mask_array > 0))
         intermediate_mask_pixels += int(np.count_nonzero(~allowed))
 
     binary_pixel_total = background_pixels + foreground_pixels
@@ -117,16 +121,30 @@ def audit_training_data(
     else:
         background_percentage = 0.0
         foreground_percentage = 0.0
+    effective_pixel_total = effective_background_pixels + effective_foreground_pixels
+    if effective_pixel_total:
+        effective_background_percentage = 100.0 * effective_background_pixels / effective_pixel_total
+        effective_foreground_percentage = 100.0 * effective_foreground_pixels / effective_pixel_total
+    else:
+        effective_background_percentage = 0.0
+        effective_foreground_percentage = 0.0
 
     results: dict[str, int | float] = {
         "total_images": len(filenames),
         "total_corrupted_files": len(unreadable_files),
         "total_nonbinary_masks": len(nonbinary_masks),
+        "nonbinary_masks": len(nonbinary_masks),
         "background_pixels": background_pixels,
         "foreground_pixels": foreground_pixels,
         "intermediate_mask_pixels": intermediate_mask_pixels,
         "background_percentage": background_percentage,
         "foreground_percentage": foreground_percentage,
+        "strict_background_percentage": background_percentage,
+        "strict_foreground_percentage": foreground_percentage,
+        "effective_background_pixels": effective_background_pixels,
+        "effective_foreground_pixels": effective_foreground_pixels,
+        "effective_background_percentage": effective_background_percentage,
+        "effective_foreground_percentage": effective_foreground_percentage,
     }
     report = Path(report_path)
     report.parent.mkdir(parents=True, exist_ok=True)
@@ -140,8 +158,12 @@ def audit_training_data(
         f"Background pixels (value 0): {background_pixels}\n"
         f"Foreground pixels (value 1 or 255): {foreground_pixels}\n"
         f"Intermediate mask pixels (excluded): {intermediate_mask_pixels}\n"
-        f"Background: {background_percentage:.12f}% of binary pixels\n"
-        f"Foreground: {foreground_percentage:.12f}% of binary pixels\n",
+        f"Strict background: {background_percentage:.12f}% of binary pixels\n"
+        f"Strict foreground: {foreground_percentage:.12f}% of binary pixels\n"
+        f"Training-effective background pixels (value 0): {effective_background_pixels}\n"
+        f"Training-effective foreground pixels (value > 0): {effective_foreground_pixels}\n"
+        f"Training-effective background: {effective_background_percentage:.12f}% of pixels\n"
+        f"Training-effective foreground: {effective_foreground_percentage:.12f}% of pixels\n",
         encoding="utf-8",
     )
     LOGGER.info("Training data audit report saved to %s", report)

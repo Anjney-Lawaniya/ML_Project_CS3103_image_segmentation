@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import random
 from pathlib import Path
 from typing import Sequence
@@ -19,6 +20,7 @@ from PIL import Image
 LOGGER = logging.getLogger(__name__)
 SEED = 67
 CHANNEL_NAMES = ("Red", "Green", "Blue")
+VALID_IMAGE_SUFFIXES = {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
 
 
 def _read_training_filenames(split_path: Path) -> list[str]:
@@ -45,10 +47,39 @@ def _load_binary_mask(mask_path: Path, device: torch.device) -> torch.Tensor:
     return torch.from_numpy(binary).unsqueeze(0).unsqueeze(0).to(device=device)
 
 
-def _plot_class_imbalance(output_dir: Path) -> None:
-    """Save the audited background-versus-road class imbalance chart."""
+def _resolve_mask_path(mask_dir: Path, filename: str) -> Path:
+    """Find a mask by case-insensitive stem across supported image suffixes."""
+    stem = Path(filename).stem.casefold()
+    for candidate in mask_dir.iterdir():
+        if candidate.is_file() and candidate.suffix.casefold() in VALID_IMAGE_SUFFIXES:
+            if candidate.stem.casefold() == stem:
+                return candidate
+    raise FileNotFoundError(f"No mask found for {filename} in {mask_dir}")
+
+
+def _training_class_percentages(
+    filenames: Sequence[str], mask_dir: Path
+) -> tuple[float, float]:
+    """Count exact training-manifest background and effective foreground pixels."""
+    background_pixels = 0
+    foreground_pixels = 0
+    for filename in filenames:
+        with Image.open(_resolve_mask_path(mask_dir, filename)) as mask:
+            values = np.asarray(mask.convert("L"))
+        foreground_pixels += int(np.count_nonzero(values > 0))
+        background_pixels += int(np.count_nonzero(values == 0))
+    total_pixels = background_pixels + foreground_pixels
+    if total_pixels == 0:
+        return 95.24, 4.76
+    return 100.0 * background_pixels / total_pixels, 100.0 * foreground_pixels / total_pixels
+
+
+def _plot_class_imbalance(
+    output_dir: Path, background_pct: float = 95.24, foreground_pct: float = 4.76
+) -> None:
+    """Save the training-set background-versus-road class imbalance chart."""
     labels = ("Background", "Road network")
-    percentages = (95.23, 4.76)
+    percentages = (background_pct, foreground_pct)
     colors = ("#64748b", "#e4572e")
     figure, axis = plt.subplots(figsize=(7, 5), constrained_layout=True)
     bars = axis.bar(labels, percentages, color=colors, width=0.62)
@@ -104,6 +135,19 @@ def _calculate_rgb_statistics(
         "Training-fold RGB mean: R=%.8f, G=%.8f, B=%.8f",
         *means.detach().cpu().tolist(),
     )
+    statistics_path = Path("results/tables/rgb_normalization_stats.json")
+    statistics_path.parent.mkdir(parents=True, exist_ok=True)
+    statistics_path.write_text(
+        json.dumps(
+            {
+                "mean": means.detach().cpu().tolist(),
+                "std": standard_deviations.detach().cpu().tolist(),
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     LOGGER.info(
         "Training-fold RGB std:  R=%.8f, G=%.8f, B=%.8f",
         *standard_deviations.detach().cpu().tolist(),
@@ -149,7 +193,7 @@ def _plot_boundary_grid(
 
     for row_index, filename in enumerate(sampled_filenames):
         image_tensor = _load_rgb_tensor(image_dir / filename, device)
-        mask_tensor = _load_binary_mask(mask_dir / f"{Path(filename).stem}.tif", device)
+        mask_tensor = _load_binary_mask(_resolve_mask_path(mask_dir, filename), device)
         boundary = functional.conv2d(mask_tensor, laplacian, padding=1).abs().squeeze()
         boundary = boundary / boundary.max().clamp_min(1.0)
 
@@ -186,7 +230,8 @@ def generate_eda(
     plots_dir = Path(output_dir)
     plots_dir.mkdir(parents=True, exist_ok=True)
 
-    _plot_class_imbalance(plots_dir)
+    background_pct, foreground_pct = _training_class_percentages(filenames, mask_dir)
+    _plot_class_imbalance(plots_dir, background_pct, foreground_pct)
     means, standard_deviations = _calculate_rgb_statistics(
         filenames, image_dir, plots_dir, device
     )

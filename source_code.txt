@@ -1,0 +1,2726 @@
+===== src/__init__.py =====
+"""Package initializer for the satellite road extraction research code."""
+
+===== src/audit.py =====
+"""Audit training images and masks and summarize road/background pixel balance."""
+
+from __future__ import annotations
+
+import argparse
+import logging
+from pathlib import Path
+
+import numpy as np
+from PIL import Image, UnidentifiedImageError
+from tqdm import tqdm
+
+LOGGER = logging.getLogger(__name__)
+IMAGE_DIRECTORY = Path("tiff") / "train"
+MASK_DIRECTORY = Path("tiff") / "train_labels"
+VALID_IMAGE_SUFFIXES = {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
+
+
+def _resolve_pair(raw_dir: Path, filename: str) -> tuple[Path, Path]:
+    """Resolve a manifest image filename to its expected image and mask paths."""
+    image_path = raw_dir / IMAGE_DIRECTORY / filename
+    mask_dir = raw_dir / MASK_DIRECTORY
+    mask_candidates = (
+        (
+            candidate
+            for candidate in mask_dir.iterdir()
+            if candidate.is_file()
+            and candidate.suffix.casefold() in VALID_IMAGE_SUFFIXES
+            and candidate.stem.casefold() == image_path.stem.casefold()
+        )
+        if mask_dir.is_dir()
+        else iter(())
+    )
+    mask_path = next(mask_candidates, mask_dir / f"{image_path.stem}.tif")
+    return image_path, mask_path
+
+
+def audit_training_data(
+    data_dir: str = "data/raw",
+    splits_dir: str = "data/splits",
+    report_path: str = "results/tables/data_audit_summary.txt",
+) -> dict[str, int | float]:
+    """Audit every listed training pair and save pixel counts and percentages.
+
+    Only ``train.txt`` is read. Validation and held-out test manifests are not
+    opened or inspected. Foreground pixels are mask values 1 or 255; background
+    pixels are 0. Intermediate mask values are reported and excluded from the
+    binary pixel totals.
+
+    Args:
+        data_dir: Raw dataset root containing ``tiff/train`` and
+            ``tiff/train_labels``.
+        splits_dir: Directory containing the generated split manifests.
+        report_path: Destination for the plain text audit summary.
+
+    Returns:
+        A dictionary containing image, corruption, mask, and pixel counts plus
+        background and foreground percentages.
+
+    Raises:
+        FileNotFoundError: If the training manifest cannot be found.
+    """
+    train_manifest = Path(splits_dir) / "train.txt"
+    if not train_manifest.is_file():
+        raise FileNotFoundError(f"Training split manifest not found: {train_manifest}")
+    filenames = [
+        line.strip()
+        for line in train_manifest.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    raw_dir = Path(data_dir)
+    unreadable_files: set[str] = set()
+    nonbinary_masks: set[str] = set()
+    background_pixels = 0
+    foreground_pixels = 0
+    effective_background_pixels = 0
+    effective_foreground_pixels = 0
+    intermediate_mask_pixels = 0
+
+    for filename in tqdm(filenames, desc="Auditing training data", unit="pair"):
+        image_path, mask_path = _resolve_pair(raw_dir, filename)
+        image_ok = True
+        try:
+            with Image.open(image_path) as image:
+                image.verify()
+        except (OSError, ValueError, UnidentifiedImageError):
+            LOGGER.error("Unreadable or corrupted image: %s", image_path)
+            unreadable_files.add(str(image_path))
+            image_ok = False
+
+        mask_array: np.ndarray | None = None
+        try:
+            with Image.open(mask_path) as mask:
+                mask.verify()
+            with Image.open(mask_path) as mask:
+                mask_array = np.asarray(mask)
+        except (OSError, ValueError, UnidentifiedImageError):
+            LOGGER.error("Unreadable or corrupted mask: %s", mask_path)
+            unreadable_files.add(str(mask_path))
+
+        if mask_array is None:
+            continue
+        allowed = np.isin(mask_array, (0, 1, 255))
+        if not bool(np.all(allowed)):
+            nonbinary_masks.add(str(mask_path))
+            LOGGER.warning("Mask contains intermediate values: %s", mask_path)
+
+        if not image_ok:
+            continue
+        background_pixels += int(np.count_nonzero(mask_array == 0))
+        foreground_pixels += int(np.count_nonzero(np.isin(mask_array, (1, 255))))
+        effective_background_pixels += int(np.count_nonzero(mask_array == 0))
+        effective_foreground_pixels += int(np.count_nonzero(mask_array > 0))
+        intermediate_mask_pixels += int(np.count_nonzero(~allowed))
+
+    binary_pixel_total = background_pixels + foreground_pixels
+    if binary_pixel_total:
+        background_percentage = 100.0 * background_pixels / binary_pixel_total
+        foreground_percentage = 100.0 * foreground_pixels / binary_pixel_total
+    else:
+        background_percentage = 0.0
+        foreground_percentage = 0.0
+    effective_pixel_total = effective_background_pixels + effective_foreground_pixels
+    if effective_pixel_total:
+        effective_background_percentage = 100.0 * effective_background_pixels / effective_pixel_total
+        effective_foreground_percentage = 100.0 * effective_foreground_pixels / effective_pixel_total
+    else:
+        effective_background_percentage = 0.0
+        effective_foreground_percentage = 0.0
+
+    results: dict[str, int | float] = {
+        "total_images": len(filenames),
+        "total_corrupted_files": len(unreadable_files),
+        "total_nonbinary_masks": len(nonbinary_masks),
+        "nonbinary_masks": len(nonbinary_masks),
+        "background_pixels": background_pixels,
+        "foreground_pixels": foreground_pixels,
+        "intermediate_mask_pixels": intermediate_mask_pixels,
+        "background_percentage": background_percentage,
+        "foreground_percentage": foreground_percentage,
+        "strict_background_percentage": background_percentage,
+        "strict_foreground_percentage": foreground_percentage,
+        "effective_background_pixels": effective_background_pixels,
+        "effective_foreground_pixels": effective_foreground_pixels,
+        "effective_background_percentage": effective_background_percentage,
+        "effective_foreground_percentage": effective_foreground_percentage,
+    }
+    report = Path(report_path)
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text(
+        "Training Data Audit Summary\n"
+        "============================\n"
+        f"Total training images: {len(filenames)}\n"
+        f"Total unreadable/corrupted files: {len(unreadable_files)}\n"
+        "Pixel totals include only pairs with a readable image and mask.\n"
+        f"Masks with non-binary values: {len(nonbinary_masks)}\n"
+        f"Background pixels (value 0): {background_pixels}\n"
+        f"Foreground pixels (value 1 or 255): {foreground_pixels}\n"
+        f"Intermediate mask pixels (excluded): {intermediate_mask_pixels}\n"
+        f"Strict background: {background_percentage:.12f}% of binary pixels\n"
+        f"Strict foreground: {foreground_percentage:.12f}% of binary pixels\n"
+        f"Training-effective background pixels (value 0): {effective_background_pixels}\n"
+        f"Training-effective foreground pixels (value > 0): {effective_foreground_pixels}\n"
+        f"Training-effective background: {effective_background_percentage:.12f}% of pixels\n"
+        f"Training-effective foreground: {effective_foreground_percentage:.12f}% of pixels\n",
+        encoding="utf-8",
+    )
+    LOGGER.info("Training data audit report saved to %s", report)
+    return results
+
+
+def main() -> None:
+    """Parse command-line paths and run the training-only dataset audit."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-dir", default="data/raw", help="Raw dataset root")
+    parser.add_argument("--splits-dir", default="data/splits", help="Split manifest directory")
+    parser.add_argument(
+        "--report-path",
+        default="results/tables/data_audit_summary.txt",
+        help="Output text report path",
+    )
+    args = parser.parse_args()
+    audit_training_data(args.data_dir, args.splits_dir, args.report_path)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+    main()
+
+===== src/baselines.py =====
+"""Static segmentation baselines for satellite road extraction."""
+
+from __future__ import annotations
+
+import torch
+from torch import Tensor, nn
+
+
+class ConvBlock(nn.Module):
+    """Two consecutive convolution, batch-normalization, and ReLU layers."""
+
+    def __init__(self, input_channels: int, output_channels: int) -> None:
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Conv2d(input_channels, output_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(output_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(output_channels, output_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(output_channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        return self.layers(inputs)
+
+
+class StaticUNet(nn.Module):
+    """Four-stage encoder-decoder U-Net that returns one-channel logits."""
+
+    def __init__(self, input_channels: int = 3, output_channels: int = 1) -> None:
+        super().__init__()
+        self.encoder1 = ConvBlock(input_channels, 64)
+        self.encoder2 = ConvBlock(64, 128)
+        self.encoder3 = ConvBlock(128, 256)
+        self.encoder4 = ConvBlock(256, 512)
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.bottleneck = ConvBlock(512, 1024)
+
+        self.up4 = nn.ConvTranspose2d(1024, 512, kernel_size=2, stride=2)
+        self.decoder4 = ConvBlock(1024, 512)
+        self.up3 = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)
+        self.decoder3 = ConvBlock(512, 256)
+        self.up2 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
+        self.decoder2 = ConvBlock(256, 128)
+        self.up1 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        self.decoder1 = ConvBlock(128, 64)
+        self.output_layer = nn.Conv2d(64, output_channels, kernel_size=1)
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        encoder1 = self.encoder1(inputs)
+        encoder2 = self.encoder2(self.pool(encoder1))
+        encoder3 = self.encoder3(self.pool(encoder2))
+        encoder4 = self.encoder4(self.pool(encoder3))
+        bottleneck = self.bottleneck(self.pool(encoder4))
+
+        decoder4 = self.up4(bottleneck)
+        decoder4 = self.decoder4(torch.cat((decoder4, encoder4), dim=1))
+        decoder3 = self.up3(decoder4)
+        decoder3 = self.decoder3(torch.cat((decoder3, encoder3), dim=1))
+        decoder2 = self.up2(decoder3)
+        decoder2 = self.decoder2(torch.cat((decoder2, encoder2), dim=1))
+        decoder1 = self.up1(decoder2)
+        decoder1 = self.decoder1(torch.cat((decoder1, encoder1), dim=1))
+        return self.output_layer(decoder1)
+
+
+class AttentionGate(nn.Module):
+    """Learn a spatial coefficient map for filtering an encoder skip feature."""
+
+    def __init__(self, gating_channels: int, skip_channels: int, intermediate_channels: int) -> None:
+        super().__init__()
+        self.weight_g = nn.Conv2d(gating_channels, intermediate_channels, kernel_size=1, bias=True)
+        self.weight_x = nn.Conv2d(skip_channels, intermediate_channels, kernel_size=1, bias=True)
+        self.relu = nn.ReLU(inplace=True)
+        self.psi = nn.Conv2d(intermediate_channels, 1, kernel_size=1, bias=True)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, gating_signal: Tensor, skip_feature: Tensor) -> Tensor:
+        attention_coefficients = self.sigmoid(
+            self.psi(self.relu(self.weight_g(gating_signal) + self.weight_x(skip_feature)))
+        )
+        return skip_feature * attention_coefficients
+
+
+class SoftAttentionUNet(nn.Module):
+    """Four-stage U-Net that soft-attends to encoder features before fusion."""
+
+    def __init__(self, input_channels: int = 3, output_channels: int = 1) -> None:
+        super().__init__()
+        self.encoder1 = ConvBlock(input_channels, 64)
+        self.encoder2 = ConvBlock(64, 128)
+        self.encoder3 = ConvBlock(128, 256)
+        self.encoder4 = ConvBlock(256, 512)
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.bottleneck = ConvBlock(512, 1024)
+
+        self.up4 = nn.ConvTranspose2d(1024, 512, kernel_size=2, stride=2)
+        self.attention4 = AttentionGate(512, 512, 256)
+        self.decoder4 = ConvBlock(1024, 512)
+        self.up3 = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)
+        self.attention3 = AttentionGate(256, 256, 128)
+        self.decoder3 = ConvBlock(512, 256)
+        self.up2 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
+        self.attention2 = AttentionGate(128, 128, 64)
+        self.decoder2 = ConvBlock(256, 128)
+        self.up1 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        self.attention1 = AttentionGate(64, 64, 32)
+        self.decoder1 = ConvBlock(128, 64)
+        self.output_layer = nn.Conv2d(64, output_channels, kernel_size=1)
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        encoder1 = self.encoder1(inputs)
+        encoder2 = self.encoder2(self.pool(encoder1))
+        encoder3 = self.encoder3(self.pool(encoder2))
+        encoder4 = self.encoder4(self.pool(encoder3))
+        bottleneck = self.bottleneck(self.pool(encoder4))
+
+        decoder4 = self.up4(bottleneck)
+        attended4 = self.attention4(decoder4, encoder4)
+        decoder4 = self.decoder4(torch.cat((decoder4, attended4), dim=1))
+        decoder3 = self.up3(decoder4)
+        attended3 = self.attention3(decoder3, encoder3)
+        decoder3 = self.decoder3(torch.cat((decoder3, attended3), dim=1))
+        decoder2 = self.up2(decoder3)
+        attended2 = self.attention2(decoder2, encoder2)
+        decoder2 = self.decoder2(torch.cat((decoder2, attended2), dim=1))
+        decoder1 = self.up1(decoder2)
+        attended1 = self.attention1(decoder1, encoder1)
+        decoder1 = self.decoder1(torch.cat((decoder1, attended1), dim=1))
+        return self.output_layer(decoder1)
+
+
+if __name__ == "__main__":
+    model = StaticUNet().to("cuda")
+    dummy_input = torch.randn(1, 3, 512, 512, device="cuda")
+    output = model(dummy_input)
+    print(tuple(output.shape))
+
+===== src/dataloaders.py =====
+"""Dataset and DataLoader construction for leakage-free road segmentation."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Callable
+
+import numpy as np
+import torch
+from PIL import Image
+from torch import Tensor
+from torch.utils.data import DataLoader, Dataset
+
+from src.transforms import get_train_transforms, get_val_test_transforms
+
+PairTransform = Callable[[Image.Image, Image.Image], tuple[Tensor, Tensor]]
+IMAGE_SUFFIXES = {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
+RANDOM_SEED = 67
+
+
+class MassachusettsRoadsDataset(Dataset[tuple[Tensor, Tensor]]):
+    """Load RGB image and binary road-mask pairs listed in a split manifest.
+
+    Manifest entries contain image filenames. Images are read from
+    ``raw_data_root/tiff/train`` and masks are matched by stem in
+    ``raw_data_root/tiff/train_labels``.
+    """
+
+    def __init__(
+        self,
+        split_manifest: str | Path,
+        raw_data_root: str | Path,
+        transforms: PairTransform | None = None,
+    ) -> None:
+        """Initialize manifest entries, raw paths, and an optional pair transform."""
+        self.split_manifest = Path(split_manifest)
+        self.raw_data_root = Path(raw_data_root)
+        self.image_dir = self.raw_data_root / "tiff" / "train"
+        self.mask_dir = self.raw_data_root / "tiff" / "train_labels"
+        self.transforms = transforms
+
+        if not self.split_manifest.is_file():
+            raise FileNotFoundError(f"Split manifest not found: {self.split_manifest}")
+        if not self.image_dir.is_dir():
+            raise FileNotFoundError(f"Image directory not found: {self.image_dir}")
+        if not self.mask_dir.is_dir():
+            raise FileNotFoundError(f"Mask directory not found: {self.mask_dir}")
+
+        self.filenames = [
+            line.strip()
+            for line in self.split_manifest.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        masks_by_stem: dict[str, Path] = {}
+        for path in self.mask_dir.iterdir():
+            if path.is_file() and path.suffix.casefold() in IMAGE_SUFFIXES:
+                key = path.stem.casefold()
+                if key in masks_by_stem:
+                    raise ValueError(f"Multiple masks share the same filename stem: {path.stem}")
+                masks_by_stem[key] = path
+
+        self.samples: list[tuple[Path, Path]] = []
+        for filename in self.filenames:
+            image_path = self.image_dir / filename
+            mask_path = masks_by_stem.get(Path(filename).stem.casefold())
+            if not image_path.is_file():
+                raise FileNotFoundError(f"Image listed in manifest not found: {image_path}")
+            if mask_path is None:
+                raise FileNotFoundError(f"No mask found for image listed in manifest: {filename}")
+            self.samples.append((image_path, mask_path))
+
+    def __len__(self) -> int:
+        """Return the number of image-mask pairs in this manifest."""
+        return len(self.samples)
+
+    def __getitem__(self, index: int) -> tuple[Tensor, Tensor]:
+        """Load, transform, and return one normalized image/mask tensor pair."""
+        image_path, mask_path = self.samples[index]
+        with Image.open(image_path) as image_file:
+            image = image_file.convert("RGB")
+        with Image.open(mask_path) as mask_file:
+            mask = mask_file.convert("L")
+
+        if self.transforms is not None:
+            image_tensor, mask_tensor = self.transforms(image, mask)
+        else:
+            image_array = np.asarray(image, dtype=np.uint8).copy()
+            mask_array = np.asarray(mask, dtype=np.uint8).copy()
+            image_tensor = torch.from_numpy(image_array).permute(2, 0, 1).to(torch.float32).div_(255.0)
+            mask_tensor = torch.from_numpy(mask_array).unsqueeze(0).to(torch.float32)
+            mask_tensor = (mask_tensor > 0).to(torch.float32)
+
+        if image_tensor.ndim != 3 or image_tensor.shape[0] != 3:
+            raise ValueError(f"Expected image tensor [3,H,W], got {tuple(image_tensor.shape)}")
+        if mask_tensor.ndim == 2:
+            mask_tensor = mask_tensor.unsqueeze(0)
+        if mask_tensor.ndim != 3 or mask_tensor.shape[0] != 1:
+            raise ValueError(f"Expected mask tensor [1,H,W], got {tuple(mask_tensor.shape)}")
+        mask_tensor = (mask_tensor > 0.5).to(torch.float32)
+        return image_tensor.to(torch.float32), mask_tensor
+
+
+def get_dataloaders(
+    batch_size: int,
+    num_workers: int = 4,
+    data_dir: str | Path = "data/raw",
+    splits_dir: str | Path = "data/splits",
+) -> tuple[DataLoader[tuple[Tensor, Tensor]], DataLoader[tuple[Tensor, Tensor]], DataLoader[tuple[Tensor, Tensor]]]:
+    """Create train, validation, and test loaders from the three manifests.
+
+    The training loader shuffles with a fixed generator seed. Validation and
+    test loaders preserve manifest order. All three use only their own manifest
+    and receive the appropriate paired transforms.
+    """
+    if batch_size <= 0:
+        raise ValueError("batch_size must be a positive integer")
+    if num_workers < 0:
+        raise ValueError("num_workers must be nonnegative")
+
+    split_dir = Path(splits_dir)
+    raw_data_root = Path(data_dir)
+    train_dataset = MassachusettsRoadsDataset(
+        split_dir / "train.txt", raw_data_root, get_train_transforms()
+    )
+    validation_dataset = MassachusettsRoadsDataset(
+        split_dir / "val.txt", raw_data_root, get_val_test_transforms()
+    )
+    test_dataset = MassachusettsRoadsDataset(
+        split_dir / "test.txt", raw_data_root, get_val_test_transforms()
+    )
+
+    generator = torch.Generator()
+    generator.manual_seed(RANDOM_SEED)
+    common_loader_options = {
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "pin_memory": torch.cuda.is_available(),
+        "persistent_workers": num_workers > 0,
+    }
+    train_loader = DataLoader(
+        train_dataset, shuffle=True, generator=generator, **common_loader_options
+    )
+    validation_loader = DataLoader(
+        validation_dataset, shuffle=False, **common_loader_options
+    )
+    test_loader = DataLoader(test_dataset, shuffle=False, **common_loader_options)
+    return train_loader, validation_loader, test_loader
+
+===== src/dataset.py =====
+"""Create reproducible, leakage-aware filename splits for the roads dataset."""
+
+from __future__ import annotations
+
+import logging
+import random
+from pathlib import Path
+
+LOGGER = logging.getLogger(__name__)
+RANDOM_SEED = 67
+IMAGE_DIRECTORY = Path("tiff") / "train"
+MASK_DIRECTORY = Path("tiff") / "train_labels"
+IMAGE_SUFFIXES = {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
+
+
+def create_deterministic_splits(data_dir: str, splits_dir: str) -> None:
+    """Find paired image/mask files and write seeded 70/15/15 split manifests.
+
+    ``data_dir`` is the raw data directory (normally ``data/raw``). Each
+    manifest stores image filenames, one per line; masks are matched by stem
+    under ``tiff/train_labels``. Pair matching is case-insensitive by stem.
+
+    Args:
+        data_dir: Root of the raw dataset directory.
+        splits_dir: Directory in which train, validation, and test manifests
+            will be written.
+
+    Raises:
+        FileNotFoundError: If either expected source directory is missing.
+        ValueError: If no valid image/mask pairs are found.
+    """
+    raw_root = Path(data_dir)
+    image_dir = raw_root / IMAGE_DIRECTORY
+    mask_dir = raw_root / MASK_DIRECTORY
+    if not image_dir.is_dir():
+        raise FileNotFoundError(f"Image directory not found: {image_dir}")
+    if not mask_dir.is_dir():
+        raise FileNotFoundError(f"Mask directory not found: {mask_dir}")
+
+    masks_by_stem = {
+        path.stem.casefold(): path
+        for path in mask_dir.iterdir()
+        if path.is_file() and path.suffix.casefold() in IMAGE_SUFFIXES
+    }
+    pairs = []
+    for image_path in sorted(image_dir.iterdir(), key=lambda path: path.name.casefold()):
+        if image_path.is_file() and image_path.suffix.casefold() in IMAGE_SUFFIXES:
+            mask_path = masks_by_stem.get(image_path.stem.casefold())
+            if mask_path is not None:
+                pairs.append(image_path.name)
+            else:
+                LOGGER.warning("Skipping image without matching mask: %s", image_path)
+
+    if not pairs:
+        raise ValueError(f"No valid image-mask pairs found in {image_dir} and {mask_dir}")
+
+    random.Random(RANDOM_SEED).shuffle(pairs)
+    train_end = int(len(pairs) * 0.70)
+    validation_end = train_end + int(len(pairs) * 0.15)
+    partitions = {
+        "train": pairs[:train_end],
+        "val": pairs[train_end:validation_end],
+        "test": pairs[validation_end:],
+    }
+
+    output_dir = Path(splits_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for split_name, filenames in partitions.items():
+        manifest = output_dir / f"{split_name}.txt"
+        manifest.write_text("".join(f"{filename}\n" for filename in filenames), encoding="utf-8")
+        LOGGER.info("Wrote %d filenames to %s", len(filenames), manifest)
+
+
+def main() -> None:
+    """Regenerate split manifests with the configured dataset paths."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-dir", default="data/raw", help="Raw dataset root")
+    parser.add_argument("--splits-dir", default="data/splits", help="Split manifest directory")
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    create_deterministic_splits(args.data_dir, args.splits_dir)
+
+
+if __name__ == "__main__":
+    main()
+
+===== src/dynamic_unet.py =====
+"""Dynamic U-Net with entropy-gated skip pruning and dual-path decoding."""
+
+from __future__ import annotations
+
+import torch
+import torch.nn.functional as functional
+from torch import Tensor, nn
+
+from src.entropy_gate import ShannonEntropyGate
+
+
+class EncoderBlock(nn.Module):
+    """Two convolutional layers with batch normalization and ReLU activation."""
+
+    def __init__(self, input_channels: int, output_channels: int) -> None:
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Conv2d(input_channels, output_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(output_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(output_channels, output_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(output_channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, feature_map: Tensor) -> Tensor:
+        return self.layers(feature_map)
+
+
+class DualPathDecoderBlock(nn.Module):
+    """Route active sites through sparse 3x3 layers and others through 1x1."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.high_entropy_convolution1 = nn.Conv2d(
+            channels, channels, kernel_size=3, padding=1, bias=False
+        )
+        self.high_entropy_normalization1 = nn.LayerNorm(channels)
+        self.high_entropy_convolution2 = nn.Conv2d(
+            channels, channels, kernel_size=3, padding=1, bias=False
+        )
+        self.high_entropy_normalization2 = nn.LayerNorm(channels)
+        self.low_entropy_projection = nn.Conv2d(
+            channels, channels, kernel_size=1, bias=False
+        )
+        self.low_entropy_normalization = nn.LayerNorm(channels)
+        self.activation = nn.ReLU(inplace=True)
+
+    @staticmethod
+    def _sparse_convolution(
+        feature_map: Tensor,
+        convolution: nn.Conv2d,
+        active_mask: Tensor,
+    ) -> Tensor:
+        batch_size, _, height, width = feature_map.shape
+        unfolded_patches = functional.unfold(
+            feature_map,
+            kernel_size=convolution.kernel_size,
+            dilation=convolution.dilation,
+            padding=convolution.padding,
+            stride=convolution.stride,
+        )
+        flattened_outputs = []
+        for batch_index in range(batch_size):
+            active_indices = active_mask[batch_index, 0].reshape(-1).nonzero(as_tuple=False).reshape(-1)
+            if active_indices.numel() == 0:
+                flattened_output = feature_map.new_zeros(
+                    (convolution.out_channels, height * width)
+                )
+            else:
+                active_patches = unfolded_patches[batch_index].index_select(
+                    1, active_indices
+                ).transpose(0, 1)
+                active_values = functional.linear(
+                    active_patches,
+                    convolution.weight.flatten(start_dim=1),
+                    convolution.bias,
+                ).transpose(0, 1)
+                flattened_output = feature_map.new_zeros(
+                    (convolution.out_channels, height * width)
+                ).index_copy(1, active_indices, active_values.to(feature_map.dtype))
+            flattened_outputs.append(
+                flattened_output.reshape(convolution.out_channels, height, width)
+            )
+        return torch.stack(flattened_outputs, dim=0)
+
+    @staticmethod
+    def _normalize_channels(feature_map: Tensor, normalization: nn.LayerNorm) -> Tensor:
+        channels_last = feature_map.permute(0, 2, 3, 1)
+        return normalization(channels_last).permute(0, 3, 1, 2)
+
+    def forward(self, fused_feature: Tensor, routing_mask: Tensor) -> Tensor:
+        active_mask = routing_mask.to(dtype=torch.bool)
+        active_neighborhood = functional.max_pool2d(
+            active_mask.to(dtype=fused_feature.dtype), kernel_size=3, stride=1, padding=1
+        ).to(dtype=torch.bool)
+        high_entropy_features = self._sparse_convolution(
+            fused_feature,
+            self.high_entropy_convolution1,
+            active_neighborhood,
+        )
+        high_entropy_features = self.activation(
+            self._normalize_channels(
+                high_entropy_features,
+                self.high_entropy_normalization1,
+            )
+        )
+        high_entropy_features = torch.where(
+            active_neighborhood,
+            high_entropy_features,
+            torch.zeros_like(high_entropy_features),
+        )
+        high_entropy_features = self._sparse_convolution(
+            high_entropy_features,
+            self.high_entropy_convolution2,
+            active_mask,
+        )
+        high_entropy_features = self.activation(
+            self._normalize_channels(
+                high_entropy_features,
+                self.high_entropy_normalization2,
+            )
+        )
+        low_entropy_features = self.low_entropy_projection(fused_feature)
+        low_entropy_features = self.activation(
+            self._normalize_channels(
+                low_entropy_features,
+                self.low_entropy_normalization,
+            )
+        )
+        return torch.where(
+            active_mask,
+            fused_feature + high_entropy_features,
+            low_entropy_features,
+        )
+
+
+class DenseDecoderStage(nn.Module):
+    """Upsample and densely fuse the coarsest decoder skip feature."""
+
+    def __init__(self, input_channels: int, skip_channels: int, output_channels: int) -> None:
+        super().__init__()
+        self.upsample = nn.ConvTranspose2d(
+            input_channels, output_channels, kernel_size=2, stride=2
+        )
+        self.fusion = EncoderBlock(output_channels + skip_channels, output_channels)
+
+    def forward(self, decoder_feature: Tensor, skip_feature: Tensor) -> Tensor:
+        upsampled_feature = self.upsample(decoder_feature)
+        return self.fusion(torch.cat((upsampled_feature, skip_feature), dim=1))
+
+
+class GatedDecoderStage(nn.Module):
+    """Predict entropy, prune a skip, fuse features, and execute both lanes."""
+
+    def __init__(
+        self,
+        input_channels: int,
+        skip_channels: int,
+        output_channels: int,
+        threshold: float,
+    ) -> None:
+        super().__init__()
+        self.upsample = nn.ConvTranspose2d(
+            input_channels, output_channels, kernel_size=2, stride=2
+        )
+        self.auxiliary_head = nn.Conv2d(output_channels, 1, kernel_size=1)
+        self.entropy_gate = ShannonEntropyGate(threshold=threshold)
+        self.fusion = nn.Sequential(
+            nn.Conv2d(output_channels + skip_channels, output_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(output_channels),
+            nn.ReLU(inplace=True),
+        )
+        self.decoder_block = DualPathDecoderBlock(output_channels)
+
+    def forward(
+        self,
+        decoder_feature: Tensor,
+        skip_feature: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        upsampled_feature = self.upsample(decoder_feature)
+        auxiliary_logits = self.auxiliary_head(upsampled_feature)
+        routing_mask, _ = self.entropy_gate(auxiliary_logits)
+        pruned_skip = skip_feature * routing_mask.to(dtype=skip_feature.dtype)
+        fused_feature = self.fusion(
+            torch.cat((upsampled_feature, pruned_skip), dim=1)
+        )
+        routed_feature = self.decoder_block(fused_feature, routing_mask)
+        return routed_feature, auxiliary_logits, routing_mask
+
+
+class DynamicUNet(nn.Module):
+    """Four-stage U-Net with deep-supervised entropy-routed fine decoders."""
+
+    def __init__(
+        self,
+        input_channels: int = 3,
+        output_channels: int = 1,
+        threshold: float = 0.5,
+    ) -> None:
+        super().__init__()
+        self.threshold = float(threshold)
+        self.encoder1 = EncoderBlock(input_channels, 64)
+        self.encoder2 = EncoderBlock(64, 128)
+        self.encoder3 = EncoderBlock(128, 256)
+        self.encoder4 = EncoderBlock(256, 512)
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.bottleneck = EncoderBlock(512, 1024)
+        self.decoder4 = DenseDecoderStage(1024, 512, 512)
+        self.decoder3 = GatedDecoderStage(512, 256, 256, self.threshold)
+        self.decoder2 = GatedDecoderStage(256, 128, 128, self.threshold)
+        self.decoder1 = GatedDecoderStage(128, 64, 64, self.threshold)
+        self.output_layer = nn.Conv2d(64, output_channels, kernel_size=1)
+
+    def set_entropy_threshold(self, threshold: float) -> None:
+        """Update the threshold used by every internal Shannon entropy gate."""
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError("Entropy threshold must be in the range [0, 1]")
+        self.threshold = float(threshold)
+        for module in self.modules():
+            if isinstance(module, ShannonEntropyGate):
+                module.threshold = self.threshold
+
+    def forward(
+        self,
+        inputs: Tensor,
+        return_internals: bool = False,
+    ) -> Tensor | tuple[Tensor, list[Tensor], list[Tensor]]:
+        encoder1 = self.encoder1(inputs)
+        encoder2 = self.encoder2(self.pool(encoder1))
+        encoder3 = self.encoder3(self.pool(encoder2))
+        encoder4 = self.encoder4(self.pool(encoder3))
+        bottleneck = self.bottleneck(self.pool(encoder4))
+        decoder4 = self.decoder4(bottleneck, encoder4)
+        decoder3, auxiliary_logits3, routing_mask3 = self.decoder3(decoder4, encoder3)
+        decoder2, auxiliary_logits2, routing_mask2 = self.decoder2(decoder3, encoder2)
+        decoder1, auxiliary_logits1, routing_mask1 = self.decoder1(decoder2, encoder1)
+        logits = self.output_layer(decoder1)
+        if return_internals:
+            return (
+                logits,
+                [auxiliary_logits3, auxiliary_logits2, auxiliary_logits1],
+                [routing_mask3, routing_mask2, routing_mask1],
+            )
+        return logits
+
+
+if __name__ == "__main__":
+    model = DynamicUNet().to("cuda")
+    dummy_input = torch.randn(1, 3, 512, 512, device="cuda")
+    output = model(dummy_input)
+    print(tuple(output.shape))
+
+===== src/eda.py =====
+"""Create training-fold EDA plots and RGB normalization statistics."""
+
+from __future__ import annotations
+
+import logging
+import json
+import random
+from pathlib import Path
+from typing import Sequence
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn.functional as functional
+from PIL import Image
+
+LOGGER = logging.getLogger(__name__)
+SEED = 67
+CHANNEL_NAMES = ("Red", "Green", "Blue")
+VALID_IMAGE_SUFFIXES = {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
+
+
+def _read_training_filenames(split_path: Path) -> list[str]:
+    """Read only the training manifest and return its nonempty filenames."""
+    if not split_path.is_file():
+        raise FileNotFoundError(f"Training split manifest not found: {split_path}")
+    return [line.strip() for line in split_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def _load_rgb_tensor(image_path: Path, device: torch.device) -> torch.Tensor:
+    """Load an image as an RGB float tensor in CHW layout on ``device``."""
+    with Image.open(image_path) as image:
+        rgb = np.asarray(image.convert("RGB"), dtype=np.uint8).copy()
+    return torch.from_numpy(rgb).permute(2, 0, 1).to(device=device, dtype=torch.float32).div_(255.0)
+
+
+def _load_binary_mask(mask_path: Path, device: torch.device) -> torch.Tensor:
+    """Load a road mask as a 1x1xHxW float tensor on ``device``."""
+    with Image.open(mask_path) as mask:
+        values = np.asarray(mask).copy()
+    if values.ndim == 3:
+        values = values[..., 0]
+    binary = (values > 0).astype(np.float32, copy=False)
+    return torch.from_numpy(binary).unsqueeze(0).unsqueeze(0).to(device=device)
+
+
+def _resolve_mask_path(mask_dir: Path, filename: str) -> Path:
+    """Find a mask by case-insensitive stem across supported image suffixes."""
+    stem = Path(filename).stem.casefold()
+    for candidate in mask_dir.iterdir():
+        if candidate.is_file() and candidate.suffix.casefold() in VALID_IMAGE_SUFFIXES:
+            if candidate.stem.casefold() == stem:
+                return candidate
+    raise FileNotFoundError(f"No mask found for {filename} in {mask_dir}")
+
+
+def _training_class_percentages(
+    filenames: Sequence[str], mask_dir: Path
+) -> tuple[float, float]:
+    """Count exact training-manifest background and effective foreground pixels."""
+    background_pixels = 0
+    foreground_pixels = 0
+    for filename in filenames:
+        with Image.open(_resolve_mask_path(mask_dir, filename)) as mask:
+            values = np.asarray(mask.convert("L"))
+        foreground_pixels += int(np.count_nonzero(values > 0))
+        background_pixels += int(np.count_nonzero(values == 0))
+    total_pixels = background_pixels + foreground_pixels
+    if total_pixels == 0:
+        return 95.24, 4.76
+    return 100.0 * background_pixels / total_pixels, 100.0 * foreground_pixels / total_pixels
+
+
+def _plot_class_imbalance(
+    output_dir: Path, background_pct: float = 95.24, foreground_pct: float = 4.76
+) -> None:
+    """Save the training-set background-versus-road class imbalance chart."""
+    labels = ("Background", "Road network")
+    percentages = (background_pct, foreground_pct)
+    colors = ("#64748b", "#e4572e")
+    figure, axis = plt.subplots(figsize=(7, 5), constrained_layout=True)
+    bars = axis.bar(labels, percentages, color=colors, width=0.62)
+    axis.set_ylabel("Pixels (%)")
+    axis.set_ylim(0, 108)
+    axis.set_title("Target Class Imbalance")
+    axis.grid(axis="y", alpha=0.25)
+    for bar, percentage in zip(bars, percentages):
+        axis.annotate(
+            f"{percentage:.2f}%",
+            (bar.get_x() + bar.get_width() / 2, bar.get_height()),
+            xytext=(0, 7),
+            textcoords="offset points",
+            ha="center",
+            fontweight="bold",
+        )
+    figure.savefig(output_dir / "class_imbalance.png", dpi=300, bbox_inches="tight")
+    plt.close(figure)
+
+
+def _calculate_rgb_statistics(
+    filenames: Sequence[str], image_dir: Path, output_dir: Path, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Aggregate global RGB mean, population standard deviation, and histograms.
+
+    Image tensors and all channel reductions/histogram accumulation run on the
+    selected torch device. Only the final small histogram arrays are copied to
+    CPU for Matplotlib rendering.
+    """
+    channel_sum = torch.zeros(3, dtype=torch.float64, device=device)
+    channel_square_sum = torch.zeros(3, dtype=torch.float64, device=device)
+    channel_histograms = torch.zeros((3, 256), dtype=torch.float64, device=device)
+    pixel_count = 0
+
+    for filename in filenames:
+        image_tensor = _load_rgb_tensor(image_dir / filename, device)
+        image64 = image_tensor.to(dtype=torch.float64)
+        channel_sum += image64.sum(dim=(1, 2))
+        channel_square_sum += image64.square().sum(dim=(1, 2))
+        for channel_index in range(3):
+            channel_histograms[channel_index] += torch.histc(
+                image_tensor[channel_index], bins=256, min=0.0, max=1.0
+            ).to(dtype=torch.float64)
+        pixel_count += image_tensor.shape[1] * image_tensor.shape[2]
+
+    if pixel_count == 0:
+        raise ValueError("The training manifest contains no images")
+    means = channel_sum / pixel_count
+    variances = torch.clamp(channel_square_sum / pixel_count - means.square(), min=0.0)
+    standard_deviations = variances.sqrt()
+
+    LOGGER.info(
+        "Training-fold RGB mean: R=%.8f, G=%.8f, B=%.8f",
+        *means.detach().cpu().tolist(),
+    )
+    statistics_path = Path("results/tables/rgb_normalization_stats.json")
+    statistics_path.parent.mkdir(parents=True, exist_ok=True)
+    statistics_path.write_text(
+        json.dumps(
+            {
+                "mean": means.detach().cpu().tolist(),
+                "std": standard_deviations.detach().cpu().tolist(),
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    LOGGER.info(
+        "Training-fold RGB std:  R=%.8f, G=%.8f, B=%.8f",
+        *standard_deviations.detach().cpu().tolist(),
+    )
+
+    histogram_cpu = channel_histograms.detach().cpu().numpy()
+    intensity_centers = np.linspace(0.0, 1.0, 256)
+    figure, axis = plt.subplots(figsize=(9, 5), constrained_layout=True)
+    for channel_index, (channel_name, color) in enumerate(
+        zip(CHANNEL_NAMES, ("red", "green", "blue"))
+    ):
+        axis.plot(
+            intensity_centers,
+            histogram_cpu[channel_index],
+            color=color,
+            alpha=0.78,
+            linewidth=1.25,
+            label=channel_name,
+        )
+    axis.set_xlabel("Normalized pixel intensity")
+    axis.set_ylabel("Pixel count")
+    axis.set_title("Training-fold RGB Pixel Distribution")
+    axis.legend()
+    axis.grid(alpha=0.2)
+    figure.savefig(output_dir / "rgb_distribution.png", dpi=300, bbox_inches="tight")
+    plt.close(figure)
+    return means, standard_deviations
+
+
+def _plot_boundary_grid(
+    filenames: Sequence[str], image_dir: Path, mask_dir: Path, output_dir: Path, device: torch.device
+) -> None:
+    """Save three seeded random training examples with GPU-computed boundaries."""
+    if len(filenames) < 3:
+        raise ValueError(f"Need at least three training pairs; found {len(filenames)}")
+    sampled_filenames = random.sample(list(filenames), 3)
+    laplacian = torch.tensor(
+        [[[[0.0, 1.0, 0.0], [1.0, -4.0, 1.0], [0.0, 1.0, 0.0]]]],
+        dtype=torch.float32,
+        device=device,
+    )
+    figure, axes = plt.subplots(3, 3, figsize=(12, 12), constrained_layout=True)
+
+    for row_index, filename in enumerate(sampled_filenames):
+        image_tensor = _load_rgb_tensor(image_dir / filename, device)
+        mask_tensor = _load_binary_mask(_resolve_mask_path(mask_dir, filename), device)
+        boundary = functional.conv2d(mask_tensor, laplacian, padding=1).abs().squeeze()
+        boundary = boundary / boundary.max().clamp_min(1.0)
+
+        image_display = image_tensor.permute(1, 2, 0).detach().cpu().numpy()
+        mask_display = mask_tensor.squeeze().detach().cpu().numpy()
+        boundary_display = boundary.detach().cpu().numpy()
+        axes[row_index, 0].imshow(image_display)
+        axes[row_index, 0].set_title(f"RGB Image\n{filename}")
+        axes[row_index, 1].imshow(mask_display, cmap="gray", vmin=0, vmax=1)
+        axes[row_index, 1].set_title("Ground Truth Binary Mask")
+        axes[row_index, 2].imshow(boundary_display, cmap="magma", vmin=0, vmax=1)
+        axes[row_index, 2].set_title(f"{device.type.upper()} Laplacian Boundary Map")
+        for axis in axes[row_index]:
+            axis.axis("off")
+
+    figure.savefig(output_dir / "boundary_overlay_grid.png", dpi=300, bbox_inches="tight")
+    plt.close(figure)
+
+
+def generate_eda(
+    data_dir: str = "data/raw",
+    splits_dir: str = "data/splits",
+    output_dir: str = "results/plots",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Generate required EDA figures and RGB statistics from training data only."""
+    torch.manual_seed(SEED)
+    random.seed(SEED)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    LOGGER.info("EDA computation device: %s", device)
+
+    filenames = _read_training_filenames(Path(splits_dir) / "train.txt")
+    image_dir = Path(data_dir) / "tiff" / "train"
+    mask_dir = Path(data_dir) / "tiff" / "train_labels"
+    plots_dir = Path(output_dir)
+    plots_dir.mkdir(parents=True, exist_ok=True)
+
+    background_pct, foreground_pct = _training_class_percentages(filenames, mask_dir)
+    _plot_class_imbalance(plots_dir, background_pct, foreground_pct)
+    means, standard_deviations = _calculate_rgb_statistics(
+        filenames, image_dir, plots_dir, device
+    )
+    _plot_boundary_grid(filenames, image_dir, mask_dir, plots_dir, device)
+    return means, standard_deviations
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+    generate_eda()
+
+===== src/entropy_gate.py =====
+"""Parameter-free Shannon entropy routing with a straight-through estimator."""
+
+from __future__ import annotations
+
+import torch
+from torch import Tensor, nn
+
+
+class StraightThroughEstimator(torch.autograd.Function):
+    """Binarize continuous entropy while passing upstream gradients unchanged."""
+
+    @staticmethod
+    def forward(ctx: object, entropy: Tensor, threshold: float) -> Tensor:
+        return (entropy > threshold).to(dtype=entropy.dtype)
+
+    @staticmethod
+    def backward(ctx: object, output_gradient: Tensor) -> tuple[Tensor, None]:
+        return output_gradient, None
+
+
+class ShannonEntropyGate(nn.Module):
+    """Threshold normalized binary entropy from one-channel auxiliary logits."""
+
+    def __init__(self, threshold: float = 0.5, eps: float = 1e-7) -> None:
+        super().__init__()
+        self.threshold = float(threshold)
+        self.eps = float(eps)
+
+    def forward(self, auxiliary_logits: Tensor) -> tuple[Tensor, Tensor]:
+        probabilities = torch.sigmoid(auxiliary_logits.float()).clamp(
+            min=self.eps,
+            max=1.0 - self.eps,
+        )
+        entropy = -(
+            probabilities * torch.log2(probabilities)
+            + (1.0 - probabilities) * torch.log2(1.0 - probabilities)
+        )
+        routing_mask = StraightThroughEstimator.apply(entropy, self.threshold)
+        return routing_mask, entropy
+
+===== src/evaluate.py =====
+"""Reusable inference metrics, threshold sweeps, and routing policy studies."""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from typing import Any
+
+import numpy as np
+import torch
+import torch.nn.functional as functional
+from torch import Tensor
+from torch.utils.data import DataLoader
+
+from src.dynamic_unet import DynamicUNet
+from src.flops_profiler import compute_dilated_routing_mask, dynamic_decoder_gflops
+from src.metrics import compute_confusion_counts, metrics_from_counts
+
+try:
+    from scipy.ndimage import distance_transform_edt
+except ImportError:
+    distance_transform_edt = None
+
+
+def extract_binary_boundary(binary_mask: Tensor, radius: int = 1) -> Tensor:
+    """Extract a binary morphological-gradient boundary using replicate padding."""
+    if radius < 0:
+        raise ValueError("radius must be nonnegative")
+    binary_mask = binary_mask.float()
+    if radius == 0:
+        return torch.zeros_like(binary_mask, dtype=torch.bool)
+    kernel_size = 2 * radius + 1
+    padded_mask = functional.pad(
+        binary_mask, (radius, radius, radius, radius), mode="replicate"
+    )
+    dilated_mask = functional.max_pool2d(padded_mask, kernel_size, stride=1)
+    eroded_mask = -functional.max_pool2d(-padded_mask, kernel_size, stride=1)
+    return dilated_mask > eroded_mask
+
+
+def compute_boundary_f1(
+    logits: Tensor,
+    targets: Tensor,
+    boundary_radius: int = 1,
+    tolerance_radius: int = 2,
+) -> float:
+    """Compute symmetric boundary F1 with a configurable pixel matching band."""
+    predicted_boundary = extract_binary_boundary(torch.sigmoid(logits) >= 0.5, boundary_radius)
+    target_boundary = extract_binary_boundary(targets >= 0.5, boundary_radius)
+    predicted_count = int(predicted_boundary.sum().item())
+    target_count = int(target_boundary.sum().item())
+    if predicted_count == 0 and target_count == 0:
+        return 1.0
+    if predicted_count == 0 or target_count == 0:
+        return 0.0
+    kernel_size = 2 * tolerance_radius + 1
+    predicted_neighborhood = functional.max_pool2d(
+        predicted_boundary.float(), kernel_size, stride=1, padding=tolerance_radius
+    ) > 0
+    target_neighborhood = functional.max_pool2d(
+        target_boundary.float(), kernel_size, stride=1, padding=tolerance_radius
+    ) > 0
+    matched_predictions = int((predicted_boundary & target_neighborhood).sum().item())
+    matched_targets = int((target_boundary & predicted_neighborhood).sum().item())
+    precision = matched_predictions / predicted_count
+    recall = matched_targets / target_count
+    return 2.0 * precision * recall / (precision + recall) if precision + recall else 0.0
+
+
+def _directed_distances_torch(
+    source_coordinates: Tensor, destination_coordinates: Tensor, chunk_size: int = 1024
+) -> Tensor:
+    """Compute chunked nearest-neighbor distances without a full pairwise matrix."""
+    distance_chunks = []
+    for chunk_start in range(0, source_coordinates.shape[0], chunk_size):
+        coordinate_chunk = source_coordinates[chunk_start : chunk_start + chunk_size]
+        distance_chunks.append(torch.cdist(coordinate_chunk, destination_coordinates).min(dim=1).values)
+    return torch.cat(distance_chunks)
+
+
+def compute_hd95(
+    logits: Tensor, targets: Tensor, boundary_radius: int = 1
+) -> tuple[float, bool]:
+    """Compute symmetric 95th-percentile boundary distance and validity flag.
+
+    The boolean is true only when both predicted and target boundaries are
+    nonempty. Empty-set cases receive a finite diagonal-distance penalty (or
+    zero when both are empty) and are excluded from valid HD95 summaries.
+    """
+    predicted_boundary = extract_binary_boundary(
+        torch.sigmoid(logits) >= 0.5, boundary_radius
+    )
+    target_boundary = extract_binary_boundary(targets >= 0.5, boundary_radius)
+    per_image_distances: list[float] = []
+    all_valid = True
+    for predicted_mask, target_mask in zip(predicted_boundary, target_boundary):
+        predicted_coordinates = torch.nonzero(predicted_mask[0], as_tuple=False).float()
+        target_coordinates = torch.nonzero(target_mask[0], as_tuple=False).float()
+        if not predicted_coordinates.numel() and not target_coordinates.numel():
+            per_image_distances.append(0.0)
+            all_valid = False
+            continue
+        if not predicted_coordinates.numel() or not target_coordinates.numel():
+            height, width = predicted_mask.shape[-2:]
+            per_image_distances.append(float((height**2 + width**2) ** 0.5))
+            all_valid = False
+            continue
+        if distance_transform_edt is not None:
+            predicted_array = predicted_mask[0].detach().cpu().numpy().astype(bool)
+            target_array = target_mask[0].detach().cpu().numpy().astype(bool)
+            predicted_to_target = distance_transform_edt(~target_array)[predicted_array]
+            target_to_predicted = distance_transform_edt(~predicted_array)[target_array]
+            distances = np.concatenate((predicted_to_target, target_to_predicted))
+            per_image_distances.append(float(np.percentile(distances, 95)))
+        else:
+            predicted_to_target = _directed_distances_torch(
+                predicted_coordinates, target_coordinates
+            )
+            target_to_predicted = _directed_distances_torch(
+                target_coordinates, predicted_coordinates
+            )
+            distances = torch.cat((predicted_to_target, target_to_predicted))
+            per_image_distances.append(float(torch.quantile(distances, 0.95).item()))
+    return (float(np.mean(per_image_distances)) if per_image_distances else 0.0, all_valid)
+
+
+def bootstrap_confidence_interval(
+    values: Sequence[float],
+    num_bootstrap: int = 1000,
+    confidence: float = 0.95,
+    seed: int = 67,
+) -> tuple[float, float, float]:
+    """Return the sample mean and seeded percentile bootstrap confidence bounds."""
+    sample = np.asarray(values, dtype=np.float64)
+    if sample.size == 0:
+        return float("nan"), float("nan"), float("nan")
+    if num_bootstrap <= 0:
+        raise ValueError("num_bootstrap must be positive")
+    if not 0.0 < confidence < 1.0:
+        raise ValueError("confidence must be between 0 and 1")
+    generator = np.random.default_rng(seed)
+    indices = generator.integers(0, sample.size, size=(num_bootstrap, sample.size))
+    means = sample[indices].mean(axis=1)
+    tail = (1.0 - confidence) / 2.0
+    lower, upper = np.quantile(means, (tail, 1.0 - tail))
+    return float(sample.mean()), float(lower), float(upper)
+
+
+def _update_counts(total: dict[str, int], batch: dict[str, int]) -> None:
+    """Accumulate the four confusion count fields in place."""
+    for key, value in batch.items():
+        total[key] = total.get(key, 0) + value
+
+
+def _mask_counts(
+    routing_masks: Sequence[Tensor],
+) -> tuple[list[float], list[int], list[float], list[int]]:
+    """Return raw and dilated active counts and pixel totals per stage."""
+    raw_counts = [float(mask.float().sum().item()) for mask in routing_masks]
+    raw_totals = [mask.numel() for mask in routing_masks]
+    dilated_masks = [compute_dilated_routing_mask(mask) for mask in routing_masks]
+    dilated_counts = [float(mask.float().sum().item()) for mask in dilated_masks]
+    dilated_totals = [mask.numel() for mask in dilated_masks]
+    return raw_counts, raw_totals, dilated_counts, dilated_totals
+
+
+@torch.no_grad()
+def evaluate_threshold_sweep(
+    model: DynamicUNet,
+    data_loader: DataLoader,
+    thresholds: Sequence[float],
+    device: torch.device | str,
+) -> list[dict[str, float]]:
+    """Evaluate micro metrics and nominal/halo FLOPs across gate thresholds."""
+    device = torch.device(device)
+    original_threshold = model.threshold
+    original_training_state = model.training
+    results: list[dict[str, float]] = []
+    try:
+        model.eval()
+        for threshold in thresholds:
+            model.set_entropy_threshold(float(threshold))
+            counts = {"true_positives": 0, "false_positives": 0, "false_negatives": 0, "true_negatives": 0}
+            raw_stage_counts: list[float] | None = None
+            raw_stage_totals: list[int] | None = None
+            halo_stage_counts: list[float] | None = None
+            halo_stage_totals: list[int] | None = None
+            for inputs, targets in data_loader:
+                inputs = inputs.to(device, non_blocking=True)
+                targets = targets.to(device, non_blocking=True)
+                logits, _, routing_masks = model(inputs, return_internals=True)
+                _update_counts(counts, compute_confusion_counts(logits.float(), targets.float()))
+                raw_counts, raw_totals, halo_counts, halo_totals = _mask_counts(routing_masks)
+                if raw_stage_counts is None:
+                    raw_stage_counts = [0.0] * len(raw_counts)
+                    raw_stage_totals = [0] * len(raw_totals)
+                    halo_stage_counts = [0.0] * len(halo_counts)
+                    halo_stage_totals = [0] * len(halo_totals)
+                for stage_index in range(len(raw_counts)):
+                    raw_stage_counts[stage_index] += raw_counts[stage_index]
+                    raw_stage_totals[stage_index] += raw_totals[stage_index]
+                    halo_stage_counts[stage_index] += halo_counts[stage_index]
+                    halo_stage_totals[stage_index] += halo_totals[stage_index]
+            raw_fractions = [
+                count / total if total else 0.0
+                for count, total in zip(raw_stage_counts or [], raw_stage_totals or [])
+            ]
+            halo_fractions = [
+                count / total if total else 0.0
+                for count, total in zip(halo_stage_counts or [], halo_stage_totals or [])
+            ]
+            metrics = metrics_from_counts(counts)
+            results.append(
+                {
+                    "threshold": float(threshold),
+                    **metrics,
+                    "raw_active_percentage": 100.0 * float(np.mean(raw_fractions)) if raw_fractions else 0.0,
+                    "dilated_halo_active_percentage": 100.0 * float(np.mean(halo_fractions)) if halo_fractions else 0.0,
+                    "nominal_decoder_gflops": dynamic_decoder_gflops(raw_fractions),
+                    "halo_adjusted_decoder_gflops": dynamic_decoder_gflops(
+                        raw_fractions,
+                        dilated_active_fractions=halo_fractions,
+                        conditional_low_entropy=False,
+                    ),
+                }
+            )
+    finally:
+        model.set_entropy_threshold(original_threshold)
+        model.train(original_training_state)
+    return results
+
+
+def _policy_hook(stage_index: int, state: dict[str, Any], seed: int):
+    """Build a per-sample random/inverted route override hook for one gate."""
+    def apply_policy(module: torch.nn.Module, module_inputs: tuple[Any, ...], module_outputs: Any):
+        """Replace gate masks with per-sample budget-matched alternatives."""
+        routing_mask, entropy_map = module_outputs
+        policy = state["policy"]
+        if policy not in ("random", "inverted"):
+            return module_outputs
+        replacement_mask = torch.zeros_like(routing_mask)
+        batch_size, _, height, width = routing_mask.shape
+        for sample_index in range(batch_size):
+            active_count = int(routing_mask[sample_index, 0].sum().item())
+            flattened_mask = replacement_mask[sample_index, 0].reshape(-1)
+            sample_counter = state["sample_counters"][stage_index]
+            state["sample_counters"][stage_index] += 1
+            if active_count == 0:
+                continue
+            if policy == "random":
+                generator = torch.Generator(device=routing_mask.device)
+                generator.manual_seed(
+                    seed + sample_counter * 31 + stage_index
+                )
+                selected_indices = torch.randperm(
+                    height * width, generator=generator, device=routing_mask.device
+                )[:active_count]
+            else:
+                flattened_entropy = entropy_map[sample_index, 0].reshape(-1)
+                selected_indices = torch.topk(
+                    flattened_entropy, k=active_count, largest=False
+                ).indices
+            flattened_mask[selected_indices] = 1.0
+        return replacement_mask, entropy_map
+
+    return apply_policy
+
+
+@torch.no_grad()
+def evaluate_routing_policies(
+    model: DynamicUNet,
+    data_loader: DataLoader,
+    device: torch.device | str,
+    threshold: float = 0.5,
+    seed: int = 67,
+) -> list[tuple[str, dict[str, float]]]:
+    """Compare entropy, per-tile matched random/inverted, bypass, and all-active routes."""
+    device = torch.device(device)
+    original_threshold = model.threshold
+    original_training_state = model.training
+    gate_modules = (
+        model.decoder3.entropy_gate,
+        model.decoder2.entropy_gate,
+        model.decoder1.entropy_gate,
+    )
+    policy_specs = (
+        ("Shannon Entropy Routing (tau=0.5)", "entropy", threshold),
+        ("Random Bernoulli Routing (Per-Tile Matched Budget)", "random", threshold),
+        ("Inverted Confidence Routing (Bottom-k Lowest Entropy, Per-Tile Matched Budget)", "inverted", threshold),
+        ("Pure 1x1 Bypass (tau=1.0, 0% Active 3x3)", "entropy", 1.0),
+        ("All-Active Dynamic U-Net (tau=0.0, 100% Active 3x3)", "entropy", 0.0),
+    )
+    results: list[tuple[str, dict[str, float]]] = []
+    hook_handles = []
+    try:
+        model.eval()
+        for display_name, policy_name, policy_threshold in policy_specs:
+            state: dict[str, Any] = {
+                "policy": policy_name,
+                "sample_counters": [0, 0, 0],
+            }
+            if policy_name in ("random", "inverted"):
+                hook_handles = [
+                    gate.register_forward_hook(_policy_hook(index, state, seed))
+                    for index, gate in enumerate(gate_modules)
+                ]
+            model.set_entropy_threshold(policy_threshold)
+            counts = {"true_positives": 0, "false_positives": 0, "false_negatives": 0, "true_negatives": 0}
+            raw_stage_counts: list[float] | None = None
+            raw_stage_totals: list[int] | None = None
+            halo_stage_counts: list[float] | None = None
+            halo_stage_totals: list[int] | None = None
+            for inputs, targets in data_loader:
+                inputs = inputs.to(device, non_blocking=True)
+                targets = targets.to(device, non_blocking=True)
+                logits, _, routing_masks = model(inputs, return_internals=True)
+                _update_counts(counts, compute_confusion_counts(logits.float(), targets.float()))
+                raw_counts, raw_totals, halo_counts, halo_totals = _mask_counts(routing_masks)
+                if raw_stage_counts is None:
+                    raw_stage_counts = [0.0] * len(raw_counts)
+                    raw_stage_totals = [0] * len(raw_totals)
+                    halo_stage_counts = [0.0] * len(halo_counts)
+                    halo_stage_totals = [0] * len(halo_totals)
+                for stage_index in range(len(raw_counts)):
+                    raw_stage_counts[stage_index] += raw_counts[stage_index]
+                    raw_stage_totals[stage_index] += raw_totals[stage_index]
+                    halo_stage_counts[stage_index] += halo_counts[stage_index]
+                    halo_stage_totals[stage_index] += halo_totals[stage_index]
+            for handle in hook_handles:
+                handle.remove()
+            hook_handles = []
+            raw_fractions = [
+                count / total if total else 0.0
+                for count, total in zip(raw_stage_counts or [], raw_stage_totals or [])
+            ]
+            halo_fractions = [
+                count / total if total else 0.0
+                for count, total in zip(halo_stage_counts or [], halo_stage_totals or [])
+            ]
+            metrics = metrics_from_counts(counts)
+            metrics.update(
+                {
+                    "raw_active_percentage": 100.0 * float(np.mean(raw_fractions)) if raw_fractions else 0.0,
+                    "dilated_halo_active_percentage": 100.0 * float(np.mean(halo_fractions)) if halo_fractions else 0.0,
+                    "nominal_decoder_gflops": dynamic_decoder_gflops(raw_fractions),
+                    "halo_adjusted_decoder_gflops": dynamic_decoder_gflops(
+                        raw_fractions,
+                        dilated_active_fractions=halo_fractions,
+                        conditional_low_entropy=False,
+                    ),
+                }
+            )
+            results.append((display_name, metrics))
+    finally:
+        for handle in hook_handles:
+            handle.remove()
+        model.set_entropy_threshold(original_threshold)
+        model.train(original_training_state)
+    return results
+
+===== src/flops_profiler.py =====
+"""Analytical convolution FLOPs and model parameter accounting utilities."""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+
+import torch.nn.functional as functional
+from torch import Tensor, nn
+
+
+def convolution_gflops(
+    spatial_size: int, input_channels: int, output_channels: int, kernel_size: int
+) -> float:
+    """Return multiply-add GFLOPs for a same-resolution 2D convolution."""
+    return (
+        2.0 * spatial_size**2 * input_channels * output_channels * kernel_size**2
+        / 1e9
+    )
+
+
+def decoder_transpose_gflops(
+    spatial_size: int,
+    input_channels: int,
+    output_channels: int,
+    kernel_size: int = 2,
+) -> float:
+    """Return multiply-add GFLOPs for stride-two transposed convolution."""
+    input_spatial_size = spatial_size // 2
+    return (
+        2.0 * input_spatial_size**2 * input_channels * output_channels * kernel_size**2
+        / 1e9
+    )
+
+
+def encoder_bottleneck_gflops(
+    input_resolution: int = 512, input_channels: int = 3
+) -> float:
+    """Return two-convolution FLOPs for the shared encoder and bottleneck."""
+    total_cost = 0.0
+    stage_specs = ((64, input_channels), (128, 64), (256, 128), (512, 256))
+    for stage_index, (output_channels, stage_input_channels) in enumerate(stage_specs):
+        spatial_size = input_resolution // (2**stage_index)
+        total_cost += convolution_gflops(
+            spatial_size, stage_input_channels, output_channels, 3
+        )
+        total_cost += convolution_gflops(
+            spatial_size, output_channels, output_channels, 3
+        )
+    bottleneck_resolution = input_resolution // 16
+    total_cost += convolution_gflops(
+        bottleneck_resolution, 512, 1024, 3
+    )
+    total_cost += convolution_gflops(
+        bottleneck_resolution, 1024, 1024, 3
+    )
+    return total_cost
+
+
+_DECODER_STAGE_SPECS = (
+    (64, 1024, 512),
+    (128, 512, 256),
+    (256, 256, 128),
+    (512, 128, 64),
+)
+_GATED_STAGE_SPECS = _DECODER_STAGE_SPECS[1:]
+
+
+def static_decoder_gflops(input_resolution: int = 512) -> float:
+    """Return analytical dense decoder FLOPs for the four-stage Static U-Net."""
+    total_cost = 0.0
+    for spatial_size, input_channels, output_channels in _DECODER_STAGE_SPECS:
+        scaled_spatial_size = spatial_size * input_resolution // 512
+        total_cost += decoder_transpose_gflops(
+            scaled_spatial_size, input_channels, output_channels
+        )
+        total_cost += convolution_gflops(
+            scaled_spatial_size, output_channels * 2, output_channels, 3
+        )
+        total_cost += convolution_gflops(
+            scaled_spatial_size, output_channels, output_channels, 3
+        )
+    total_cost += convolution_gflops(input_resolution, 64, 1, 1)
+    return total_cost
+
+
+def attention_decoder_gflops(input_resolution: int = 512) -> float:
+    """Return dense decoder FLOPs plus the four soft attention gates."""
+    total_cost = static_decoder_gflops(input_resolution)
+    for spatial_size, _, output_channels in _DECODER_STAGE_SPECS:
+        scaled_spatial_size = spatial_size * input_resolution // 512
+        intermediate_channels = output_channels // 2
+        total_cost += convolution_gflops(
+            scaled_spatial_size, output_channels, intermediate_channels, 1
+        )
+        total_cost += convolution_gflops(
+            scaled_spatial_size, output_channels, intermediate_channels, 1
+        )
+        total_cost += convolution_gflops(
+            scaled_spatial_size, intermediate_channels, 1, 1
+        )
+    return total_cost
+
+
+def dynamic_decoder_gflops(
+    active_fractions: Sequence[float],
+    dilated_active_fractions: Sequence[float] | None = None,
+    conditional_low_entropy: bool = True,
+) -> float:
+    """Return nominal or halo-adjusted FLOPs for the Dynamic U-Net decoder."""
+    if len(active_fractions) != len(_GATED_STAGE_SPECS):
+        raise ValueError("Expected one active fraction for each of three gated stages")
+    if dilated_active_fractions is not None and len(dilated_active_fractions) != len(
+        _GATED_STAGE_SPECS
+    ):
+        raise ValueError("Expected one dilated active fraction for each gated stage")
+    if any(not 0.0 <= value <= 1.0 for value in active_fractions):
+        raise ValueError("Active fractions must be in the range [0, 1]")
+    if dilated_active_fractions is not None and any(
+        not 0.0 <= value <= 1.0 for value in dilated_active_fractions
+    ):
+        raise ValueError("Dilated active fractions must be in the range [0, 1]")
+
+    coarse_resolution, coarse_input_channels, coarse_output_channels = _DECODER_STAGE_SPECS[0]
+    total_cost = decoder_transpose_gflops(
+        coarse_resolution, coarse_input_channels, coarse_output_channels
+    )
+    total_cost += convolution_gflops(
+        coarse_resolution, coarse_output_channels * 2, coarse_output_channels, 3
+    )
+    total_cost += convolution_gflops(
+        coarse_resolution, coarse_output_channels, coarse_output_channels, 3
+    )
+
+    for stage_index, ((spatial_size, input_channels, output_channels), active_fraction) in enumerate(
+        zip(_GATED_STAGE_SPECS, active_fractions)
+    ):
+        total_cost += decoder_transpose_gflops(spatial_size, input_channels, output_channels)
+        total_cost += convolution_gflops(spatial_size, output_channels, 1, 1)
+        total_cost += convolution_gflops(spatial_size, output_channels * 2, output_channels, 1)
+        convolution1_fraction = (
+            dilated_active_fractions[stage_index]
+            if dilated_active_fractions is not None
+            else active_fraction
+        )
+        total_cost += convolution1_fraction * convolution_gflops(
+            spatial_size, output_channels, output_channels, 3
+        )
+        total_cost += active_fraction * convolution_gflops(
+            spatial_size, output_channels, output_channels, 3
+        )
+        projection_fraction = (1.0 - active_fraction) if conditional_low_entropy else 1.0
+        total_cost += projection_fraction * convolution_gflops(
+            spatial_size, output_channels, output_channels, 1
+        )
+    total_cost += convolution_gflops(512, 64, 1, 1)
+    return total_cost
+
+
+def count_parameters(model: nn.Module) -> dict[str, int]:
+    """Count all model parameters and the subset that can receive gradients."""
+    return {
+        "total_params": sum(parameter.numel() for parameter in model.parameters()),
+        "trainable_params": sum(
+            parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+        ),
+    }
+
+
+def compute_dilated_routing_mask(routing_mask: Tensor) -> Tensor:
+    """Expand active routes by the 3x3 convolution neighborhood halo."""
+    return functional.max_pool2d(
+        routing_mask.float(), kernel_size=3, stride=1, padding=1
+    ) > 0
+
+===== src/losses.py =====
+"""Binary cross-entropy, Dice, and dynamic routing objectives."""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+
+import torch
+import torch.nn.functional as functional
+from torch import Tensor, nn
+
+
+class BCEDiceLoss(nn.Module):
+    """Average binary cross-entropy and smoothed soft Dice losses."""
+
+    def __init__(self, smooth: float = 1e-6) -> None:
+        super().__init__()
+        self.binary_cross_entropy = nn.BCEWithLogitsLoss()
+        self.smooth = smooth
+
+    def forward(self, logits: Tensor, targets: Tensor) -> Tensor:
+        targets = targets.to(dtype=logits.dtype)
+        binary_cross_entropy_loss = self.binary_cross_entropy(logits, targets)
+        dice_targets = targets.float()
+        probabilities = torch.sigmoid(logits.float())
+        intersection = torch.sum(probabilities * dice_targets, dim=(1, 2, 3))
+        total_mass = torch.sum(probabilities + dice_targets, dim=(1, 2, 3))
+        dice_score = (2.0 * intersection + self.smooth) / (total_mass + self.smooth)
+        dice_loss = 1.0 - dice_score.mean()
+        return 0.5 * binary_cross_entropy_loss + 0.5 * dice_loss
+
+
+class DynamicUNetLoss(nn.Module):
+    """Combine primary, auxiliary deep supervision, and routing sparsity losses."""
+
+    def __init__(
+        self,
+        auxiliary_weight: float = 0.2,
+        flops_weight: float = 0.05,
+        smooth: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        self.segmentation_loss = BCEDiceLoss(smooth=smooth)
+        self.auxiliary_weight = auxiliary_weight
+        self.flops_weight = flops_weight
+
+    def forward(
+        self,
+        logits: Tensor,
+        targets: Tensor,
+        auxiliary_logits_list: Sequence[Tensor] | None = None,
+        routing_masks_list: Sequence[Tensor] | None = None,
+    ) -> Tensor:
+        primary_loss = self.segmentation_loss(logits, targets)
+        auxiliary_losses = []
+        for auxiliary_logits in auxiliary_logits_list or ():
+            resized_targets = functional.interpolate(
+                targets.float(),
+                size=auxiliary_logits.shape[-2:],
+                mode="nearest",
+            )
+            auxiliary_losses.append(self.segmentation_loss(auxiliary_logits, resized_targets))
+        if auxiliary_losses:
+            auxiliary_loss = torch.stack(auxiliary_losses).mean()
+        else:
+            auxiliary_loss = primary_loss.new_zeros(())
+        if routing_masks_list:
+            flops_penalty = torch.stack(
+                [routing_mask.to(dtype=logits.dtype).mean() for routing_mask in routing_masks_list]
+            ).mean()
+        else:
+            flops_penalty = primary_loss.new_zeros(())
+        return (
+            primary_loss
+            + self.auxiliary_weight * auxiliary_loss
+            + self.flops_weight * flops_penalty
+        )
+
+===== src/metrics.py =====
+"""Micro segmentation metrics derived from binary confusion counts."""
+
+from __future__ import annotations
+
+import torch
+from torch import Tensor
+
+
+def compute_confusion_counts(
+    logits: Tensor, targets: Tensor, threshold: float = 0.5
+) -> dict[str, int]:
+    """Compute pixel-level TP, FP, FN, and TN counts for a binary mask."""
+    predictions = torch.sigmoid(logits) >= threshold
+    ground_truth = targets >= 0.5
+    return {
+        "true_positives": int((predictions & ground_truth).sum().item()),
+        "false_positives": int((predictions & ~ground_truth).sum().item()),
+        "false_negatives": int((~predictions & ground_truth).sum().item()),
+        "true_negatives": int((~predictions & ~ground_truth).sum().item()),
+    }
+
+
+def metrics_from_counts(counts: dict[str, int]) -> dict[str, float]:
+    """Compute positive-class IoU, F1, precision, and recall from counts."""
+    true_positives = counts["true_positives"]
+    false_positives = counts["false_positives"]
+    false_negatives = counts["false_negatives"]
+    if true_positives == 0 and false_positives == 0 and false_negatives == 0:
+        return {"iou": 1.0, "f1_score": 1.0, "precision": 1.0, "recall": 1.0}
+    iou_denominator = true_positives + false_positives + false_negatives
+    f1_denominator = 2 * true_positives + false_positives + false_negatives
+    precision_denominator = true_positives + false_positives
+    recall_denominator = true_positives + false_negatives
+    return {
+        "iou": true_positives / iou_denominator if iou_denominator else 0.0,
+        "f1_score": 2 * true_positives / f1_denominator if f1_denominator else 0.0,
+        "precision": true_positives / precision_denominator if precision_denominator else 0.0,
+        "recall": true_positives / recall_denominator if recall_denominator else 0.0,
+    }
+
+
+def compute_segmentation_metrics(
+    logits: Tensor, targets: Tensor, threshold: float = 0.5
+) -> dict[str, float]:
+    """Compute pixel-level IoU, F1, precision, and recall for a binary mask."""
+    return metrics_from_counts(compute_confusion_counts(logits, targets, threshold))
+
+===== src/train.py =====
+"""Command-line training pipeline for road segmentation architectures."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import logging
+import random
+from pathlib import Path
+from typing import Sequence
+
+import numpy as np
+import torch
+from torch import Tensor, nn
+from tqdm import tqdm
+
+from src.baselines import SoftAttentionUNet, StaticUNet
+from src.dataloaders import get_dataloaders
+from src.dynamic_unet import DynamicUNet
+from src.losses import BCEDiceLoss, DynamicUNetLoss
+from src.metrics import compute_confusion_counts, metrics_from_counts
+
+RANDOM_SEED = 67
+LOGGER = logging.getLogger(__name__)
+
+
+def _seed_everything(seed: int = RANDOM_SEED, deterministic: bool = False) -> None:
+    """Seed Python, NumPy, and PyTorch random number generators."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.deterministic = deterministic
+        torch.backends.cudnn.benchmark = not deterministic
+
+
+def _build_model(model_name: str, threshold: float) -> nn.Module:
+    """Construct the requested baseline or dynamic U-Net model."""
+    if model_name == "static_unet":
+        return StaticUNet()
+    if model_name == "attention_unet":
+        return SoftAttentionUNet()
+    if model_name == "dynamic_unet":
+        return DynamicUNet(threshold=threshold)
+    raise ValueError(f"Unsupported model: {model_name}")
+
+
+def _forward_with_loss(
+    model: nn.Module,
+    criterion: BCEDiceLoss | DynamicUNetLoss,
+    inputs: Tensor,
+    targets: Tensor,
+    is_dynamic_model: bool,
+) -> tuple[Tensor, Tensor, list[Tensor], list[Tensor]]:
+    """Run a model and its matching segmentation objective."""
+    if is_dynamic_model:
+        logits, auxiliary_logits_list, routing_masks_list = model(
+            inputs,
+            return_internals=True,
+        )
+        loss = criterion(
+            logits,
+            targets,
+            auxiliary_logits_list,
+            routing_masks_list,
+        )
+        return logits, loss, auxiliary_logits_list, routing_masks_list
+    logits = model(inputs)
+    loss = criterion(logits, targets)
+    return logits, loss, [], []
+
+
+def train_one_epoch(
+    model: nn.Module,
+    data_loader: torch.utils.data.DataLoader,
+    criterion: BCEDiceLoss | DynamicUNetLoss,
+    optimizer: torch.optim.Optimizer,
+    scaler: torch.amp.GradScaler,
+    device: torch.device,
+    epoch_index: int,
+    epoch_count: int,
+    is_dynamic_model: bool,
+    accumulation_steps: int,
+) -> float:
+    """Train for one epoch and return the mean sample-weighted loss."""
+    if accumulation_steps <= 0:
+        raise ValueError("accumulation_steps must be a positive integer")
+    model.train()
+    total_loss = 0.0
+    sample_count = 0
+    total_batches = len(data_loader)
+    progress_bar = tqdm(
+        data_loader,
+        desc=f"Train {epoch_index}/{epoch_count}",
+        leave=False,
+    )
+    for batch_index, (inputs, targets) in enumerate(progress_bar):
+        inputs = inputs.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+            _, loss, _, _ = _forward_with_loss(
+                model,
+                criterion,
+                inputs,
+                targets,
+                is_dynamic_model,
+            )
+        accumulated_loss = loss / accumulation_steps
+        scaler.scale(accumulated_loss).backward()
+        is_accumulation_boundary = (batch_index + 1) % accumulation_steps == 0
+        is_last_batch = batch_index + 1 == total_batches
+        if is_accumulation_boundary or is_last_batch:
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+        batch_size = inputs.shape[0]
+        total_loss += float(loss.detach().item()) * batch_size
+        sample_count += batch_size
+        progress_bar.set_postfix(loss=f"{loss.detach().item():.4f}")
+    return total_loss / max(sample_count, 1)
+
+
+@torch.no_grad()
+def validate_one_epoch(
+    model: nn.Module,
+    data_loader: torch.utils.data.DataLoader,
+    criterion: BCEDiceLoss | DynamicUNetLoss,
+    device: torch.device,
+    epoch_index: int,
+    epoch_count: int,
+    is_dynamic_model: bool,
+) -> dict[str, float]:
+    """Evaluate loss, segmentation metrics, and dynamic routing utilization."""
+    model.eval()
+    total_loss = 0.0
+    sample_count = 0
+    pooled_counts = {
+        "true_positives": 0,
+        "false_positives": 0,
+        "false_negatives": 0,
+        "true_negatives": 0,
+    }
+    macro_f1_total = 0.0
+    active_percentage_total = 0.0
+    progress_bar = tqdm(
+        data_loader,
+        desc=f"Valid {epoch_index}/{epoch_count}",
+        leave=False,
+    )
+    for inputs, targets in progress_bar:
+        inputs = inputs.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+            logits, loss, _, routing_masks_list = _forward_with_loss(
+                model,
+                criterion,
+                inputs,
+                targets,
+                is_dynamic_model,
+            )
+        batch_size = inputs.shape[0]
+        total_loss += float(loss.item()) * batch_size
+        batch_counts = compute_confusion_counts(logits.float(), targets.float())
+        for metric_name, metric_value in batch_counts.items():
+            pooled_counts[metric_name] += metric_value
+        macro_f1_total += metrics_from_counts(batch_counts)["f1_score"] * batch_size
+        if routing_masks_list:
+            batch_active_percentage = 100.0 * torch.stack(
+                [routing_mask.float().mean() for routing_mask in routing_masks_list]
+            ).mean()
+            active_percentage_total += float(batch_active_percentage.item()) * batch_size
+        sample_count += batch_size
+        progress_bar.set_postfix(loss=f"{loss.item():.4f}")
+    denominator = max(sample_count, 1)
+    results = {
+        "loss": total_loss / denominator,
+        **metrics_from_counts(pooled_counts),
+        "macro_f1_score": macro_f1_total / denominator,
+        "active_percentage": active_percentage_total / denominator,
+    }
+    return results
+
+
+def _append_epoch_history(
+    log_path: Path, row: dict[str, object], overwrite: bool = False
+) -> None:
+    """Append one epoch's metrics to the model-specific CSV history."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = overwrite or not log_path.exists()
+    mode = "w" if overwrite else "a"
+    with log_path.open(mode, newline="", encoding="utf-8") as log_file:
+        writer = csv.DictWriter(log_file, fieldnames=list(row))
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def parse_args(arguments: Sequence[str] | None = None) -> argparse.Namespace:
+    """Parse the command-line options for a training run."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--model",
+        choices=("static_unet", "attention_unet", "dynamic_unet"),
+        default="dynamic_unet",
+    )
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--batch_size", "--batch-size", type=int, default=4)
+    parser.add_argument("--learning_rate", "--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--flops_weight", "--flops-weight", type=float, default=0.05)
+    parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--num_workers", "--num-workers", type=int, default=4)
+    parser.add_argument("--accumulation_steps", "--accumulation-steps", type=int, default=4)
+    parsed_arguments = parser.parse_args(arguments)
+    if parsed_arguments.epochs <= 0:
+        parser.error("--epochs must be positive")
+    if parsed_arguments.batch_size <= 0:
+        parser.error("--batch_size must be positive")
+    if parsed_arguments.learning_rate <= 0.0:
+        parser.error("--learning_rate must be positive")
+    if parsed_arguments.flops_weight < 0.0:
+        parser.error("--flops_weight must be nonnegative")
+    if parsed_arguments.num_workers < 0:
+        parser.error("--num_workers must be nonnegative")
+    if parsed_arguments.accumulation_steps <= 0:
+        parser.error("--accumulation_steps must be positive")
+    if not 0.0 <= parsed_arguments.threshold <= 1.0:
+        parser.error("--threshold must be in the range [0, 1]")
+    return parsed_arguments
+
+
+def main(arguments: Sequence[str] | None = None) -> None:
+    """Run the configured training and validation epochs."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+    options = parse_args(arguments)
+    _seed_everything()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    train_loader, validation_loader, _ = get_dataloaders(
+        batch_size=options.batch_size,
+        num_workers=options.num_workers,
+    )
+    model = _build_model(options.model, options.threshold).to(device)
+    is_dynamic_model = options.model == "dynamic_unet"
+    if is_dynamic_model:
+        criterion: BCEDiceLoss | DynamicUNetLoss = DynamicUNetLoss(
+            flops_weight=options.flops_weight
+        )
+    else:
+        criterion = BCEDiceLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=options.learning_rate)
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+    checkpoint_dir = Path("models")
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = checkpoint_dir / f"best_{options.model}.pth"
+    history_path = Path("results") / "tables" / f"{options.model}_training_log.csv"
+    best_validation_f1 = float("-inf")
+
+    LOGGER.info("Training %s on %s", options.model, device)
+    for epoch_index in range(1, options.epochs + 1):
+        training_loss = train_one_epoch(
+            model,
+            train_loader,
+            criterion,
+            optimizer,
+            scaler,
+            device,
+            epoch_index,
+            options.epochs,
+            is_dynamic_model,
+            options.accumulation_steps,
+        )
+        validation_results = validate_one_epoch(
+            model,
+            validation_loader,
+            criterion,
+            device,
+            epoch_index,
+            options.epochs,
+            is_dynamic_model,
+        )
+        LOGGER.info(
+            "Epoch %d/%d | train_loss=%.6f | val_loss=%.6f | IoU=%.6f | F1=%.6f | precision=%.6f | recall=%.6f%s",
+            epoch_index,
+            options.epochs,
+            training_loss,
+            validation_results["loss"],
+            validation_results["iou"],
+            validation_results["f1_score"],
+            validation_results["precision"],
+            validation_results["recall"],
+            f" | active_3x3={validation_results['active_percentage']:.2f}%"
+            if is_dynamic_model
+            else "",
+        )
+        history_row: dict[str, object] = {
+            "epoch": epoch_index,
+            "train_loss": training_loss,
+            "validation_loss": validation_results["loss"],
+            "validation_iou": validation_results["iou"],
+            "validation_f1": validation_results["f1_score"],
+            "validation_macro_f1": validation_results["macro_f1_score"],
+            "validation_precision": validation_results["precision"],
+            "validation_recall": validation_results["recall"],
+            "active_3x3_percentage": validation_results["active_percentage"]
+            if is_dynamic_model
+            else "",
+        }
+        _append_epoch_history(history_path, history_row, overwrite=epoch_index == 1)
+        if validation_results["f1_score"] > best_validation_f1:
+            best_validation_f1 = validation_results["f1_score"]
+            torch.save(
+                {
+                    "epoch": epoch_index,
+                    "model_name": options.model,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "validation_metrics": validation_results,
+                    "random_seed": RANDOM_SEED,
+                    "threshold": options.threshold,
+                    "flops_weight": options.flops_weight,
+                    "cli_args": vars(options),
+                },
+                checkpoint_path,
+            )
+            LOGGER.info("Saved best checkpoint to %s", checkpoint_path)
+
+
+if __name__ == "__main__":
+    main()
+
+===== src/transforms.py =====
+"""Paired segmentation transforms with training-fold RGB normalization."""
+
+from __future__ import annotations
+
+import random
+from dataclasses import dataclass
+
+import numpy as np
+import torch
+from PIL import Image
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms.v2 import functional as v2_functional
+
+# Found through eda loop ran before writing this file
+TRAIN_MEAN = (0.43380652, 0.43693942, 0.40113835)
+TRAIN_STD = (0.29580833, 0.28946298, 0.30155425)
+
+
+@dataclass(frozen=True)
+class SegmentationTransform:
+    """Convert and normalize paired PIL data, optionally augmenting it jointly.
+
+    Spatial operations use torchvision.transforms.v2 functional transforms
+    with shared random decisions. Quarter-turn rotations use exact tensor
+    permutations so neither image nor binary mask receives interpolation.
+    """
+
+    training: bool
+
+    def __call__(self, image: Image.Image, mask: Image.Image) -> tuple[torch.Tensor, torch.Tensor]:
+        """Transform an RGB image and grayscale mask into normalized tensors."""
+        image_array = np.asarray(image.convert("RGB"), dtype=np.uint8).copy()
+        mask_array = np.asarray(mask.convert("L"), dtype=np.uint8).copy()
+        image_tensor = torch.from_numpy(image_array).permute(2, 0, 1).to(torch.float32).div_(255.0)
+        mask_tensor = torch.from_numpy(mask_array).unsqueeze(0).to(torch.float32)
+        image_tensor = v2_functional.resize(
+            image_tensor,
+            size=[512, 512],
+            interpolation=InterpolationMode.BILINEAR,
+        )
+        mask_tensor = v2_functional.resize(
+            mask_tensor,
+            size=[512, 512],
+            interpolation=InterpolationMode.NEAREST,
+        )
+        mask_tensor = (mask_tensor > 0).to(torch.float32)
+
+        if image_tensor.shape[-2:] != mask_tensor.shape[-2:]:
+            raise ValueError(
+                "Image and mask dimensions differ: "
+                f"{tuple(image_tensor.shape[-2:])} vs {tuple(mask_tensor.shape[-2:])}"
+            )
+
+        if self.training:
+            if random.random() < 0.5:
+                image_tensor = v2_functional.horizontal_flip(image_tensor)
+                mask_tensor = v2_functional.horizontal_flip(mask_tensor)
+            if random.random() < 0.5:
+                image_tensor = v2_functional.vertical_flip(image_tensor)
+                mask_tensor = v2_functional.vertical_flip(mask_tensor)
+            if random.random() < 0.5:
+                quarter_turns = random.choice((1, 2, 3))
+                image_tensor = torch.rot90(image_tensor, k=quarter_turns, dims=(-2, -1))
+                mask_tensor = torch.rot90(mask_tensor, k=quarter_turns, dims=(-2, -1))
+
+        mean = torch.tensor(TRAIN_MEAN, dtype=image_tensor.dtype).view(3, 1, 1)
+        std = torch.tensor(TRAIN_STD, dtype=image_tensor.dtype).view(3, 1, 1)
+        image_tensor = (image_tensor - mean) / std
+        mask_tensor = (mask_tensor > 0.5).to(torch.float32)
+        return image_tensor.to(torch.float32), mask_tensor.to(torch.float32)
+
+
+def get_train_transforms() -> SegmentationTransform:
+    """Return paired random flips/quarter-turn rotation and normalization."""
+    return SegmentationTransform(training=True)
+
+
+def get_val_test_transforms() -> SegmentationTransform:
+    """Return deterministic tensor conversion and training-fold normalization."""
+    return SegmentationTransform(training=False)
+
+===== evaluation.ipynb =====
+--- Cell 1 ---
+import random
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+from tqdm.auto import tqdm
+
+from src.baselines import SoftAttentionUNet, StaticUNet
+from src.dataloaders import get_dataloaders
+from src.dynamic_unet import DynamicUNet
+from src.evaluate import (
+    bootstrap_confidence_interval,
+    compute_boundary_f1,
+    compute_hd95,
+    evaluate_routing_policies,
+    evaluate_threshold_sweep,
+)
+from src.flops_profiler import (
+    attention_decoder_gflops,
+    convolution_gflops,
+    count_parameters,
+    dynamic_decoder_gflops,
+    encoder_bottleneck_gflops,
+    static_decoder_gflops,
+)
+from src.losses import BCEDiceLoss
+from src.metrics import (
+    compute_confusion_counts,
+    compute_segmentation_metrics,
+    metrics_from_counts,
+)
+from src.transforms import TRAIN_MEAN, TRAIN_STD
+
+random.seed(67)
+np.random.seed(67)
+torch.manual_seed(67)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(67)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+figure_directory = Path("results/figures")
+figure_directory.mkdir(parents=True, exist_ok=True)
+
+--- Cell 2 ---
+static_model = StaticUNet().to(device)
+attention_model = SoftAttentionUNet().to(device)
+dynamic_model = DynamicUNet().to(device)
+
+checkpoint_specs = (
+    (static_model, Path("models/best_static_unet.pth")),
+    (attention_model, Path("models/best_attention_unet.pth")),
+    (dynamic_model, Path("models/best_dynamic_unet.pth")),
+)
+for model, checkpoint_path in checkpoint_specs:
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location=device,
+        weights_only=True,
+    )
+    model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+    model.eval()
+
+_, val_loader, test_loader = get_dataloaders(batch_size=1, num_workers=4)
+
+--- Cell 3 ---
+def accumulate_counts(total_counts, logits, targets):
+    batch_counts = compute_confusion_counts(logits.float(), targets.float())
+    for count_name, count_value in batch_counts.items():
+        total_counts[count_name] += count_value
+
+
+def evaluate_fixed_model(model, data_loader):
+    total_counts = {
+        "true_positives": 0,
+        "false_positives": 0,
+        "false_negatives": 0,
+        "true_negatives": 0,
+    }
+    model.eval()
+    with torch.no_grad():
+        for inputs, targets in data_loader:
+            inputs = inputs.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+            accumulate_counts(total_counts, model(inputs), targets)
+    return total_counts, metrics_from_counts(total_counts)
+
+
+static_counts, static_metrics = evaluate_fixed_model(static_model, test_loader)
+attention_counts, attention_metrics = evaluate_fixed_model(attention_model, test_loader)
+static_parameters = count_parameters(static_model)
+attention_parameters = count_parameters(attention_model)
+encoder_gflops = encoder_bottleneck_gflops()
+static_decoder_cost = static_decoder_gflops()
+attention_decoder_cost = attention_decoder_gflops()
+
+print(f"{'Model':<24} {'Test F1':>10} {'Test IoU':>10} {'Trainable Params':>18} {'Total Params':>16} {'Decoder GFLOPs':>16} {'Total GFLOPs':>14}")
+for display_name, metrics, parameters, decoder_cost in (
+    ("Static U-Net", static_metrics, static_parameters, static_decoder_cost),
+    ("Soft Attention U-Net", attention_metrics, attention_parameters, attention_decoder_cost),
+):
+    print(
+        f"{display_name:<24} {metrics['f1_score']:>10.5f} {metrics['iou']:>10.5f} "
+        f"{parameters['trainable_params']:>18,d} {parameters['total_params']:>16,d} "
+        f"{decoder_cost:>16.3f} {encoder_gflops + decoder_cost:>14.3f}"
+    )
+
+--- Cell 4 ---
+thresholds = [0.0, 0.1, 0.3, 0.5, 0.7, 0.9, 1.0]
+validation_sweep = evaluate_threshold_sweep(
+    dynamic_model,
+    val_loader,
+    thresholds,
+    device,
+)
+selected_validation_threshold = max(
+    validation_sweep,
+    key=lambda row: row["f1_score"],
+)["threshold"]
+print(f"Validation-selected entropy threshold by micro-F1: {selected_validation_threshold:.1f}")
+print(f"{'Validation tau':>15} {'Micro F1':>12} {'Micro IoU':>12}")
+for result in validation_sweep:
+    print(f"{result['threshold']:>15.1f} {result['f1_score']:>12.5f} {result['iou']:>12.5f}")
+
+test_sweep = evaluate_threshold_sweep(
+    dynamic_model,
+    test_loader,
+    thresholds,
+    device,
+)
+print(
+    f"{'Test tau':>9} {'Micro F1':>11} {'Micro IoU':>11} {'Precision':>11} {'Recall':>11} "
+    f"{'Nominal GFLOPs':>16} {'Halo GFLOPs':>14} {'Raw Active %':>14} {'Halo Active %':>15}"
+)
+for result in test_sweep:
+    print(
+        f"{result['threshold']:>9.1f} {result['f1_score']:>11.5f} {result['iou']:>11.5f} "
+        f"{result['precision']:>11.5f} {result['recall']:>11.5f} "
+        f"{result['nominal_decoder_gflops']:>16.3f} "
+        f"{result['halo_adjusted_decoder_gflops']:>14.3f} "
+        f"{result['raw_active_percentage']:>13.2f}% "
+        f"{result['dilated_halo_active_percentage']:>14.2f}%"
+    )
+print(
+    "Dense dynamic decoder control at tau=0.0: "
+    f"{test_sweep[0]['nominal_decoder_gflops']:.3f} GFLOPs; "
+    f"pure 1x1 bypass at tau=1.0: {test_sweep[-1]['nominal_decoder_gflops']:.3f} GFLOPs."
+)
+
+--- Cell 5 ---
+dynamic_f1_scores = [result["f1_score"] for result in test_sweep]
+dynamic_gflops = [result["nominal_decoder_gflops"] for result in test_sweep]
+dynamic_thresholds = [result["threshold"] for result in test_sweep]
+
+fig, axis = plt.subplots(figsize=(8, 6), constrained_layout=True)
+axis.scatter(
+    [static_decoder_cost],
+    [static_metrics["f1_score"]],
+    color="red",
+    marker="*",
+    s=180,
+    label="Static U-Net",
+)
+axis.scatter(
+    [attention_decoder_cost],
+    [attention_metrics["f1_score"]],
+    color="blue",
+    marker="s",
+    s=80,
+    label="Soft Attention U-Net",
+)
+axis.plot(
+    dynamic_gflops,
+    dynamic_f1_scores,
+    color="green",
+    marker="o",
+    linestyle="-",
+    label="Dynamic U-Net",
+)
+for tau, gflops, f1_score in zip(dynamic_thresholds, dynamic_gflops, dynamic_f1_scores):
+    axis.annotate(
+        rf"$\tau={tau:.1f}$",
+        (gflops, f1_score),
+        xytext=(5, 6),
+        textcoords="offset points",
+    )
+axis.set_xlabel("Decoder GFLOPs")
+axis.set_ylabel("F1 Score (Dice)")
+axis.set_title("Decoder Compute vs. Road Segmentation Quality")
+axis.grid(True, alpha=0.3)
+axis.legend()
+fig.savefig(figure_directory / "pareto_frontier.png", dpi=300, bbox_inches="tight")
+plt.close(fig)
+
+--- Cell 6 ---
+visual_inputs = None
+visual_targets = None
+for candidate_inputs, candidate_targets in test_loader:
+    if bool(torch.any(candidate_targets > 0.5)):
+        visual_inputs = candidate_inputs
+        visual_targets = candidate_targets
+        break
+if visual_inputs is None:
+    visual_inputs, visual_targets = next(iter(test_loader))
+
+visual_inputs = visual_inputs.to(device)
+visual_targets = visual_targets.to(device)
+dynamic_model.set_entropy_threshold(0.5)
+with torch.no_grad():
+    static_logits = static_model(visual_inputs)
+    dynamic_logits, auxiliary_logits_list, _ = dynamic_model(
+        visual_inputs,
+        return_internals=True,
+    )
+    _, entropy_map = dynamic_model.decoder1.entropy_gate(auxiliary_logits_list[-1])
+    static_prediction = torch.sigmoid(static_logits) >= 0.5
+    dynamic_prediction = torch.sigmoid(dynamic_logits) >= 0.5
+
+mean_tensor = torch.tensor(TRAIN_MEAN, device=device).view(1, 3, 1, 1)
+std_tensor = torch.tensor(TRAIN_STD, device=device).view(1, 3, 1, 1)
+denormalized_image = (visual_inputs * std_tensor + mean_tensor).clamp(0.0, 1.0)
+image_display = denormalized_image[0].permute(1, 2, 0).cpu().numpy()
+target_display = visual_targets[0, 0].cpu().numpy()
+static_display = static_prediction[0, 0].cpu().numpy()
+dynamic_display = dynamic_prediction[0, 0].cpu().numpy()
+entropy_display = entropy_map[0, 0].cpu().numpy()
+
+fig, axes = plt.subplots(1, 5, figsize=(20, 4), constrained_layout=True)
+axes[0].imshow(image_display)
+axes[0].set_title("RGB Image")
+axes[1].imshow(target_display, cmap="gray", vmin=0, vmax=1)
+axes[1].set_title("Ground Truth")
+axes[2].imshow(static_display, cmap="gray", vmin=0, vmax=1)
+axes[2].set_title("Static U-Net")
+axes[3].imshow(dynamic_display, cmap="gray", vmin=0, vmax=1)
+axes[3].set_title("Dynamic U-Net")
+axes[4].imshow(entropy_display, cmap="magma", vmin=0, vmax=1)
+axes[4].set_title("Shannon Entropy")
+for axis in axes:
+    axis.axis("off")
+fig.savefig(figure_directory / "segmentation_overlay.png", dpi=300, bbox_inches="tight")
+plt.close(fig)
+
+--- Cell 7 ---
+import torch.nn as nn
+from torchvision.models.segmentation import deeplabv3_resnet50
+
+pixel_classifier = nn.Conv2d(3, 1, kernel_size=1).to(device)
+deep_lab_probe = deeplabv3_resnet50(weights="DEFAULT").to(device)
+for parameter in deep_lab_probe.parameters():
+    parameter.requires_grad = False
+deep_lab_probe.classifier[4] = nn.Conv2d(256, 1, kernel_size=1).to(device)
+for parameter in deep_lab_probe.classifier[4].parameters():
+    parameter.requires_grad = True
+
+train_loader, _, _ = get_dataloaders(batch_size=4, num_workers=4)
+probe_loss = BCEDiceLoss()
+pixel_optimizer = torch.optim.AdamW(pixel_classifier.parameters(), lr=1e-3)
+deep_lab_optimizer = torch.optim.AdamW(
+    deep_lab_probe.classifier[4].parameters(),
+    lr=1e-3,
+)
+pixel_scaler = torch.amp.GradScaler("cuda", enabled=device == "cuda")
+deep_lab_scaler = torch.amp.GradScaler("cuda", enabled=device == "cuda")
+project_mean = torch.tensor(TRAIN_MEAN, device=device).view(1, 3, 1, 1)
+project_std = torch.tensor(TRAIN_STD, device=device).view(1, 3, 1, 1)
+imagenet_mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+imagenet_std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+
+pixel_classifier.train()
+deep_lab_probe.eval()
+for inputs, targets in tqdm(train_loader, desc="One epoch: lightweight probes", leave=False):
+    inputs = inputs.to(device, non_blocking=True)
+    targets = targets.to(device, non_blocking=True)
+    raw_rgb = (inputs * project_std + project_mean).clamp(0.0, 1.0)
+    imagenet_inputs = (raw_rgb - imagenet_mean) / imagenet_std
+
+    pixel_optimizer.zero_grad(set_to_none=True)
+    with torch.amp.autocast(device_type=torch.device(device).type, enabled=device == "cuda"):
+        pixel_loss = probe_loss(pixel_classifier(inputs), targets)
+    pixel_scaler.scale(pixel_loss).backward()
+    pixel_scaler.step(pixel_optimizer)
+    pixel_scaler.update()
+
+    deep_lab_optimizer.zero_grad(set_to_none=True)
+    with torch.amp.autocast(device_type=torch.device(device).type, enabled=device == "cuda"):
+        deep_lab_loss = probe_loss(deep_lab_probe(imagenet_inputs)["out"], targets)
+    deep_lab_scaler.scale(deep_lab_loss).backward()
+    deep_lab_scaler.step(deep_lab_optimizer)
+    deep_lab_scaler.update()
+
+pixel_classifier.eval()
+deep_lab_probe.eval()
+probe_counts = {
+    "pixel": {"true_positives": 0, "false_positives": 0, "false_negatives": 0, "true_negatives": 0},
+    "deeplab": {"true_positives": 0, "false_positives": 0, "false_negatives": 0, "true_negatives": 0},
+}
+with torch.no_grad():
+    for inputs, targets in test_loader:
+        inputs = inputs.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        raw_rgb = (inputs * project_std + project_mean).clamp(0.0, 1.0)
+        imagenet_inputs = (raw_rgb - imagenet_mean) / imagenet_std
+        accumulate_counts(probe_counts["pixel"], pixel_classifier(inputs), targets)
+        accumulate_counts(
+            probe_counts["deeplab"],
+            deep_lab_probe(imagenet_inputs)["out"],
+            targets,
+        )
+
+
+def measure_convolution_gflops(model, sample_tensor):
+    measured_flops = {"value": 0.0}
+    hook_handles = []
+
+    def count_convolution(module, module_inputs, module_output):
+        if isinstance(module_output, torch.Tensor):
+            output_height, output_width = module_output.shape[-2:]
+            operations = (
+                2
+                * output_height
+                * output_width
+                * module.in_channels
+                * module.out_channels
+                * module.kernel_size[0]
+                * module.kernel_size[1]
+                / module.groups
+            )
+            measured_flops["value"] += operations / 1e9
+
+    for module in model.modules():
+        if isinstance(module, nn.Conv2d):
+            hook_handles.append(module.register_forward_hook(count_convolution))
+    with torch.no_grad():
+        model(sample_tensor)
+    for hook_handle in hook_handles:
+        hook_handle.remove()
+    return measured_flops["value"]
+
+
+raw_sample = (visual_inputs * project_std + project_mean).clamp(0.0, 1.0)
+imagenet_sample = (raw_sample - imagenet_mean) / imagenet_std
+deep_lab_total_gflops = measure_convolution_gflops(deep_lab_probe, imagenet_sample)
+pixel_head_gflops = convolution_gflops(512, 3, 1, 1)
+deep_lab_head_gflops = convolution_gflops(64, 256, 1, 1)
+static_total_gflops = encoder_gflops + static_decoder_cost
+attention_total_gflops = encoder_gflops + attention_decoder_cost
+dynamic_half_result = next(result for result in test_sweep if result["threshold"] == 0.5)
+dynamic_decoder_cost = dynamic_half_result["nominal_decoder_gflops"]
+dynamic_total_gflops = encoder_gflops + dynamic_decoder_cost
+
+comparison_metrics = {
+    "pixel": metrics_from_counts(probe_counts["pixel"]),
+    "deeplab": metrics_from_counts(probe_counts["deeplab"]),
+    "static": static_metrics,
+    "attention": attention_metrics,
+    "dynamic": dynamic_half_result,
+}
+comparison_parameters = {
+    "pixel": count_parameters(pixel_classifier),
+    "deeplab": count_parameters(deep_lab_probe),
+    "static": static_parameters,
+    "attention": attention_parameters,
+    "dynamic": count_parameters(dynamic_model),
+}
+comparison_rows = (
+    ("1x1 Pixel Classifier (1-epoch probe)", "pixel", pixel_head_gflops, pixel_head_gflops),
+    ("Frozen DeepLabV3-ResNet50 Probe (1 epoch)", "deeplab", deep_lab_head_gflops, deep_lab_total_gflops),
+    ("Static U-Net", "static", static_decoder_cost, static_total_gflops),
+    ("Soft Attention U-Net", "attention", attention_decoder_cost, attention_total_gflops),
+    ("Dynamic U-Net (tau=0.5)", "dynamic", dynamic_decoder_cost, dynamic_total_gflops),
+)
+print(
+    f"{'Model':<48} {'Test F1':>9} {'Test IoU':>9} {'Trainable Params':>18} "
+    f"{'Total Params':>15} {'Head/Decoder GFLOPs':>21} {'End-to-End GFLOPs':>19}"
+)
+for model_label, model_key, head_cost, end_to_end_cost in comparison_rows:
+    metrics = comparison_metrics[model_key]
+    parameters = comparison_parameters[model_key]
+    print(
+        f"{model_label:<48} {metrics['f1_score']:>9.5f} {metrics['iou']:>9.5f} "
+        f"{parameters['trainable_params']:>18,d} {parameters['total_params']:>15,d} "
+        f"{head_cost:>21.3f} {end_to_end_cost:>19.3f}"
+    )
+
+--- Cell 8 ---
+routing_policy_results = evaluate_routing_policies(
+    dynamic_model,
+    test_loader,
+    device,
+    threshold=0.5,
+    seed=67,
+)
+print(
+    f"{'Routing Policy':<82} {'F1':>9} {'IoU':>9} {'Raw Active %':>14} "
+    f"{'Halo Active %':>15} {'Nominal GFLOPs':>16} {'Halo GFLOPs':>14}"
+)
+for policy_name, policy_metrics in routing_policy_results:
+    print(
+        f"{policy_name:<82} {policy_metrics['f1_score']:>9.5f} "
+        f"{policy_metrics['iou']:>9.5f} "
+        f"{policy_metrics['raw_active_percentage']:>13.2f}% "
+        f"{policy_metrics['dilated_halo_active_percentage']:>14.2f}% "
+        f"{policy_metrics['nominal_decoder_gflops']:>16.3f} "
+        f"{policy_metrics['halo_adjusted_decoder_gflops']:>14.3f}"
+    )
+
+--- Cell 9 ---
+dynamic_model.set_entropy_threshold(0.5)
+per_image_records = []
+with torch.no_grad():
+    for inputs, targets in tqdm(test_loader, desc="Per-tile topology metrics"):
+        inputs = inputs.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        static_logits = static_model(inputs)
+        attention_logits = attention_model(inputs)
+        dynamic_logits, _, routing_masks = dynamic_model(inputs, return_internals=True)
+        dynamic_active_percentage = 100.0 * float(
+            torch.stack([routing_mask.float().mean() for routing_mask in routing_masks]).mean().item()
+        )
+        record = {
+            "road_density_percentage": 100.0 * float((targets >= 0.5).float().mean().item()),
+            "dynamic_active_percentage": dynamic_active_percentage,
+        }
+        for model_name, logits in (
+            ("static", static_logits),
+            ("attention", attention_logits),
+            ("dynamic", dynamic_logits),
+        ):
+            metrics = compute_segmentation_metrics(logits, targets)
+            hd95, hd95_valid = compute_hd95(logits, targets, boundary_radius=1)
+            record[f"{model_name}_f1"] = metrics["f1_score"]
+            record[f"{model_name}_iou"] = metrics["iou"]
+            record[f"{model_name}_boundary_f1"] = compute_boundary_f1(
+                logits,
+                targets,
+                boundary_radius=1,
+                tolerance_radius=2,
+            )
+            record[f"{model_name}_hd95"] = hd95
+            record[f"{model_name}_hd95_valid"] = hd95_valid
+        per_image_records.append(record)
+
+median_road_density = float(
+    np.median([record["road_density_percentage"] for record in per_image_records])
+)
+for record in per_image_records:
+    record["terrain_subgroup"] = (
+        "Low Road-Density Tiles (<= Median, Rural/Coastal Proxy)"
+        if record["road_density_percentage"] <= median_road_density
+        else "High Road-Density Tiles (> Median, Urban Proxy)"
+    )
+
+subgroup_names = (
+    "Low Road-Density Tiles (<= Median, Rural/Coastal Proxy)",
+    "High Road-Density Tiles (> Median, Urban Proxy)",
+)
+subgroup_metric_names = (
+    "static_f1", "static_iou", "static_boundary_f1", "static_hd95",
+    "attention_f1", "attention_iou", "attention_boundary_f1", "attention_hd95",
+    "dynamic_f1", "dynamic_iou", "dynamic_boundary_f1", "dynamic_hd95",
+)
+for subgroup_name in subgroup_names:
+    subgroup_records = [
+        record for record in per_image_records if record["terrain_subgroup"] == subgroup_name
+    ]
+    print(f"\n{subgroup_name}: n={len(subgroup_records)}")
+    for metric_name in subgroup_metric_names:
+        if metric_name.endswith("hd95"):
+            model_name = metric_name.split("_")[0]
+            valid_values = [
+                record[metric_name]
+                for record in subgroup_records
+                if record[f"{model_name}_hd95_valid"]
+            ]
+            mean_hd95 = float(np.mean(valid_values)) if valid_values else float("nan")
+            median_hd95 = float(np.median(valid_values)) if valid_values else float("nan")
+            print(
+                f"{metric_name:<23} Mean HD95={mean_hd95:.3f}, "
+                f"Median HD95={median_hd95:.3f}, valid n={len(valid_values)}"
+            )
+        else:
+            mean_value, ci_lower, ci_upper = bootstrap_confidence_interval(
+                [record[metric_name] for record in subgroup_records],
+                num_bootstrap=1000,
+                confidence=0.95,
+                seed=67,
+            )
+            print(
+                f"{metric_name:<23} Mean={mean_value:.5f}, "
+                f"95% Bootstrap CI=[{ci_lower:.5f}, {ci_upper:.5f}]"
+            )
+
+road_density_values = np.asarray(
+    [record["road_density_percentage"] for record in per_image_records]
+)
+dynamic_active_values = np.asarray(
+    [record["dynamic_active_percentage"] for record in per_image_records]
+)
+fig, axis = plt.subplots(figsize=(8, 6), constrained_layout=True)
+axis.scatter(
+    road_density_values,
+    dynamic_active_values,
+    alpha=0.75,
+    color="teal",
+    label="Test tiles",
+)
+if road_density_values.size > 1 and np.ptp(road_density_values) > 0:
+    trend_coefficients = np.polyfit(road_density_values, dynamic_active_values, deg=1)
+    trend_x = np.linspace(road_density_values.min(), road_density_values.max(), 100)
+    axis.plot(
+        trend_x,
+        np.polyval(trend_coefficients, trend_x),
+        color="darkorange",
+        linewidth=2,
+        label="Linear trend",
+    )
+axis.set_xlabel("Per-Tile Ground-Truth Road Density (%)")
+axis.set_ylabel("Dynamic U-Net Active 3x3 Compute (%)")
+axis.set_title("Adaptive Decoder Compute by Road Density")
+axis.grid(True, alpha=0.3)
+axis.legend()
+fig.savefig(
+    figure_directory / "adaptive_compute_scatter.png",
+    dpi=300,
+    bbox_inches="tight",
+)
+plt.close(fig)

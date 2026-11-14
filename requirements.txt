@@ -7,3 +7,4 @@ numpy>=1.25,<3
 Pillow>=10
 tqdm>=4.66
 matplotlib>=3.8
+scipy

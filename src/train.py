@@ -18,13 +18,13 @@ from src.baselines import SoftAttentionUNet, StaticUNet
 from src.dataloaders import get_dataloaders
 from src.dynamic_unet import DynamicUNet
 from src.losses import BCEDiceLoss, DynamicUNetLoss
-from src.metrics import compute_segmentation_metrics
+from src.metrics import compute_confusion_counts, metrics_from_counts
 
 RANDOM_SEED = 67
 LOGGER = logging.getLogger(__name__)
 
 
-def _seed_everything(seed: int = RANDOM_SEED) -> None:
+def _seed_everything(seed: int = RANDOM_SEED, deterministic: bool = False) -> None:
     """Seed Python, NumPy, and PyTorch random number generators."""
     random.seed(seed)
     np.random.seed(seed)
@@ -33,8 +33,8 @@ def _seed_everything(seed: int = RANDOM_SEED) -> None:
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
     if hasattr(torch.backends, "cudnn"):
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = deterministic
+        torch.backends.cudnn.benchmark = not deterministic
 
 
 def _build_model(model_name: str, threshold: float) -> nn.Module:
@@ -137,7 +137,13 @@ def validate_one_epoch(
     model.eval()
     total_loss = 0.0
     sample_count = 0
-    metric_totals = {"iou": 0.0, "f1_score": 0.0, "precision": 0.0, "recall": 0.0}
+    pooled_counts = {
+        "true_positives": 0,
+        "false_positives": 0,
+        "false_negatives": 0,
+        "true_negatives": 0,
+    }
+    macro_f1_total = 0.0
     active_percentage_total = 0.0
     progress_bar = tqdm(
         data_loader,
@@ -157,11 +163,12 @@ def validate_one_epoch(
             )
         batch_size = inputs.shape[0]
         total_loss += float(loss.item()) * batch_size
-        batch_metrics = compute_segmentation_metrics(logits.float(), targets.float())
-        for metric_name, metric_value in batch_metrics.items():
-            metric_totals[metric_name] += metric_value * batch_size
+        batch_counts = compute_confusion_counts(logits.float(), targets.float())
+        for metric_name, metric_value in batch_counts.items():
+            pooled_counts[metric_name] += metric_value
+        macro_f1_total += metrics_from_counts(batch_counts)["f1_score"] * batch_size
         if routing_masks_list:
-            batch_active_percentage = torch.stack(
+            batch_active_percentage = 100.0 * torch.stack(
                 [routing_mask.float().mean() for routing_mask in routing_masks_list]
             ).mean()
             active_percentage_total += float(batch_active_percentage.item()) * batch_size
@@ -170,17 +177,21 @@ def validate_one_epoch(
     denominator = max(sample_count, 1)
     results = {
         "loss": total_loss / denominator,
-        **{metric_name: metric_total / denominator for metric_name, metric_total in metric_totals.items()},
+        **metrics_from_counts(pooled_counts),
+        "macro_f1_score": macro_f1_total / denominator,
         "active_percentage": active_percentage_total / denominator,
     }
     return results
 
 
-def _append_epoch_history(log_path: Path, row: dict[str, object]) -> None:
+def _append_epoch_history(
+    log_path: Path, row: dict[str, object], overwrite: bool = False
+) -> None:
     """Append one epoch's metrics to the model-specific CSV history."""
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    write_header = not log_path.exists()
-    with log_path.open("a", newline="", encoding="utf-8") as log_file:
+    write_header = overwrite or not log_path.exists()
+    mode = "w" if overwrite else "a"
+    with log_path.open(mode, newline="", encoding="utf-8") as log_file:
         writer = csv.DictWriter(log_file, fieldnames=list(row))
         if write_header:
             writer.writeheader()
@@ -211,8 +222,8 @@ def parse_args(arguments: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--learning_rate must be positive")
     if parsed_arguments.flops_weight < 0.0:
         parser.error("--flops_weight must be nonnegative")
-    if parsed_arguments.num_workers <= 0:
-        parser.error("--num_workers must be positive with persistent workers enabled")
+    if parsed_arguments.num_workers < 0:
+        parser.error("--num_workers must be nonnegative")
     if parsed_arguments.accumulation_steps <= 0:
         parser.error("--accumulation_steps must be positive")
     if not 0.0 <= parsed_arguments.threshold <= 1.0:
@@ -222,7 +233,6 @@ def parse_args(arguments: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(arguments: Sequence[str] | None = None) -> None:
     """Run the configured training and validation epochs."""
-    torch.backends.cudnn.benchmark = True
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -293,13 +303,14 @@ def main(arguments: Sequence[str] | None = None) -> None:
             "validation_loss": validation_results["loss"],
             "validation_iou": validation_results["iou"],
             "validation_f1": validation_results["f1_score"],
+            "validation_macro_f1": validation_results["macro_f1_score"],
             "validation_precision": validation_results["precision"],
             "validation_recall": validation_results["recall"],
             "active_3x3_percentage": validation_results["active_percentage"]
             if is_dynamic_model
             else "",
         }
-        _append_epoch_history(history_path, history_row)
+        _append_epoch_history(history_path, history_row, overwrite=epoch_index == 1)
         if validation_results["f1_score"] > best_validation_f1:
             best_validation_f1 = validation_results["f1_score"]
             torch.save(
@@ -310,6 +321,9 @@ def main(arguments: Sequence[str] | None = None) -> None:
                     "optimizer_state_dict": optimizer.state_dict(),
                     "validation_metrics": validation_results,
                     "random_seed": RANDOM_SEED,
+                    "threshold": options.threshold,
+                    "flops_weight": options.flops_weight,
+                    "cli_args": vars(options),
                 },
                 checkpoint_path,
             )
@@ -317,5 +331,4 @@ def main(arguments: Sequence[str] | None = None) -> None:
 
 
 if __name__ == "__main__":
-    torch.backends.cudnn.benchmark = True
     main()

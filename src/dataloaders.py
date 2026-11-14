@@ -103,6 +103,8 @@ class MassachusettsRoadsDataset(Dataset[tuple[Tensor, Tensor]]):
 def get_dataloaders(
     batch_size: int,
     num_workers: int = 4,
+    data_dir: str | Path = "data/raw",
+    splits_dir: str | Path = "data/splits",
 ) -> tuple[DataLoader[tuple[Tensor, Tensor]], DataLoader[tuple[Tensor, Tensor]], DataLoader[tuple[Tensor, Tensor]]]:
     """Create train, validation, and test loaders from the three manifests.
 
@@ -112,11 +114,11 @@ def get_dataloaders(
     """
     if batch_size <= 0:
         raise ValueError("batch_size must be a positive integer")
-    if num_workers <= 0:
-        raise ValueError("num_workers must be positive when persistent workers are enabled")
+    if num_workers < 0:
+        raise ValueError("num_workers must be nonnegative")
 
-    split_dir = Path("data") / "splits"
-    raw_data_root = Path("data") / "raw"
+    split_dir = Path(splits_dir)
+    raw_data_root = Path(data_dir)
     train_dataset = MassachusettsRoadsDataset(
         split_dir / "train.txt", raw_data_root, get_train_transforms()
     )
@@ -133,7 +135,7 @@ def get_dataloaders(
         "batch_size": batch_size,
         "num_workers": num_workers,
         "pin_memory": torch.cuda.is_available(),
-        "persistent_workers": True,
+        "persistent_workers": num_workers > 0,
     }
     train_loader = DataLoader(
         train_dataset, shuffle=True, generator=generator, **common_loader_options
