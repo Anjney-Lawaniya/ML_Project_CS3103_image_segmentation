@@ -1,5 +1,5 @@
 # Install the CUDA 13.4 PyTorch wheels with:
-# pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu134
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu134
 torch
 torchvision
 
