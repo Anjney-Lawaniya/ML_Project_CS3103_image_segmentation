@@ -63,7 +63,7 @@ Evaluated on the held-out test split ($N = 167$ tiles, $43.78$M pixels) at the v
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/anjney-it-is/dynamic-unet-road-extraction.git
+   git clone https://github.com/Anjney-Lawaniya/ML_Project_CS3103_image_segmentation
    cd dynamic-unet-road-extraction
    ```
 
